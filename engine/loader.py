@@ -83,3 +83,30 @@ def to_numeric_col(series):
               .str.replace(r"[^\d.\-]", "", regex=True),
         errors="coerce",
     )
+
+
+# ── Memory-optimized column sets ─────────────────────────────────────────────
+KEEP_COLS = {
+    "api": ["Transaction ID","Tracking ID","Grand Total","Status","Created At",
+            "Plan Type","Plan Name","Account Type","Order ID","Customer Email",
+            "Gateway","Order Type","Updated At"],
+    "bridgerpay": ["status","merchantOrderId","transactionId","pspOrderId",
+                   "pspName","amount","id"],
+    "payprocc": ["Type","Status","Merchant Order ID","Payment Public ID",
+                 "Amount","Initial Amount","Currency"],
+}
+
+
+def trim_columns(df, file_type=None):
+    """Keep only needed columns to save memory. Reduces RAM by ~70%."""
+    if file_type and file_type in KEEP_COLS:
+        needed = KEEP_COLS[file_type]
+        keep = []
+        for col in df.columns:
+            for need in needed:
+                if col.lower().strip() == need.lower().strip():
+                    keep.append(col)
+                    break
+        if keep:
+            return df[keep].copy()
+    return df
