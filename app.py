@@ -1,366 +1,541 @@
-"""FundedNext — Revenue Reconciliation Portal"""
-import io, zipfile, datetime, traceback
+"""
+engine/phase1.py  –  Phase 1 reconciliation: API vs Banks
+Implements all 6 gateway matching rules.
+"""
 import pandas as pd
-import streamlit as st
+import numpy as np
+from .loader import load_file, concat_files, normalize, find_col, to_numeric_col, trim_columns
 
-st.set_page_config(page_title="FundedNext · Reconciliation",
-                   page_icon="💰", layout="wide",
-                   initial_sidebar_state="expanded")
+TOL_USD  = 0.01
+TOL_USDT = 0.10
 
-st.markdown("""<style>
-.fn-hdr{background:#0a1628;padding:13px 22px;border-radius:9px;
-        display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
-.fn-mark{width:36px;height:36px;background:#f5a623;border-radius:7px;
-         font-weight:900;font-size:16px;color:#0a1628;
-         display:flex;align-items:center;justify-content:center}
-.fn-brand{color:#fff;font-size:18px;font-weight:700}
-.fn-tag{color:rgba(255,255,255,.5);font-size:11px}
-.fn-period{color:rgba(255,255,255,.7);font-size:12px;text-align:right}
-.fn-period b{color:#f5a623}
-.sec{font-size:13px;font-weight:700;color:#1a2540;margin:14px 0 7px;
-     padding-left:7px;border-left:3px solid #f5a623}
-.rt{width:100%;border-collapse:collapse;font-size:12px}
-.rt th{background:#0a1628;color:#fff;padding:6px 9px;text-align:center;
-       border:1px solid #1e3a6b;white-space:nowrap;font-size:11px}
-.rt td{padding:6px 9px;text-align:right;border:1px solid #e0e6f0;white-space:nowrap}
-.rt td.nm{text-align:left;font-weight:600;background:#f5f8ff;padding-left:11px}
-.rt .d{color:#e53935;font-weight:600}
-.rt .ok{background:#e8f5e9;color:#1b5e20;font-weight:700;border-radius:3px;padding:2px 7px;display:inline-block}
-.rt .lo{background:#ffebee;color:#e53935;font-weight:700;border-radius:3px;padding:2px 7px;display:inline-block}
-.rt .pa{background:#fff3e0;color:#e65100;font-weight:700;border-radius:3px;padding:2px 7px;display:inline-block}
-.kpi-card{background:#fff;border:1px solid #dde3f0;border-radius:9px;
-          padding:12px 15px;text-align:center;box-shadow:0 1px 4px rgba(0,0,0,.06)}
-.kpi-val{font-size:22px;font-weight:800;color:#0a1628}
-.kpi-lbl{font-size:11px;color:#7a8aaa;margin-top:2px}
-.kpi-sub{font-size:11px;font-weight:600;margin-top:1px}
-</style>""", unsafe_allow_html=True)
+# ─────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────
 
-# ── Session state ─────────────────────────────────────────────────────────────
-for k,v in [("results",None),("out_files",None),("run_done",False),
-            ("api_df",None),("dup_df",None),
-            ("dl_order_wise",None),("dl_discrepancy",None),("dl_comparison",None)]:
-    if k not in st.session_state: st.session_state[k] = v
+def _verdict(df, api_col, bank_col, tol):
+    """Vectorized verdict: RECONCILED / AMOUNT MISMATCH / NOT IN BANK."""
+    no_match = df[bank_col].isna()
+    diff = (to_numeric_col(df[api_col].astype(str)) -
+            df[bank_col].fillna(0)).abs()
+    return np.where(no_match, "NOT IN BANK",
+           np.where(diff <= tol, "RECONCILED", "AMOUNT MISMATCH"))
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("## ⚙️ Settings")
-    mode = st.radio("Mode", ["Full Reconciliation","Comparison"], horizontal=True,
-                    label_visibility="collapsed")
-    st.markdown("---")
-    if mode == "Full Reconciliation":
-        st.markdown("**📅 Date Range**")
-        c1,c2 = st.columns(2)
-        with c1: start_date = st.date_input("From",value=datetime.date(2026,3,1),key="fs",label_visibility="collapsed")
-        with c2: end_date   = st.date_input("To",value=datetime.date(2026,4,21),key="fe",label_visibility="collapsed")
-        st.caption(f"{start_date} → {end_date}")
-        p1_start=start_date; p1_end=end_date; p2_start=start_date; p2_end=end_date
+
+def _prep_api(api_df, tx_prefix=None, tracking_prefix=None):
+    """Filter API rows by Transaction ID prefix or Tracking ID prefix."""
+    if tx_prefix:
+        col = find_col(api_df, ["Transaction ID", "TransactionID"])
+        if col:
+            return api_df[api_df[col].astype(str).str.startswith(tx_prefix, na=False)].copy()
+    if tracking_prefix:
+        col = find_col(api_df, ["Tracking ID", "TrackingID"])
+        if col:
+            return api_df[api_df[col].astype(str).str.startswith(tracking_prefix, na=False)].copy()
+    return pd.DataFrame()
+
+
+# ─────────────────────────────────────────────
+# Bank reconciliation functions
+# ─────────────────────────────────────────────
+
+def reconcile_bridgerpay(api_df, bp_files, tol=TOL_USD):
+    """
+    Bridgerpay (Orchestrator)
+    Match key : API Transaction ID (BP_*) = BP merchantOrderId
+    Amount    : BP amount (USD)
+    Filter    : status = approved
+    Multi-row : use approved row; fallback first row
+    """
+    bp = concat_files(bp_files) if isinstance(bp_files, list) else load_file(bp_files)
+    bp = normalize(bp)
+
+    moi = find_col(bp, ["merchantOrderId", "merchant_order_id", "Merchant Order ID"])
+    amt = find_col(bp, ["amount", "Amount"])
+    sta = find_col(bp, ["status", "Status"])
+    psn = find_col(bp, ["pspName", "psp_name", "PSP Name"])
+    trd = find_col(bp, ["transactionId", "transaction_id", "Transaction ID"])
+
+    if not moi or not amt:
+        raise ValueError(f"Bridgerpay: cannot find merchantOrderId or amount. Columns: {list(bp.columns)}")
+
+    bp[amt] = to_numeric_col(bp[amt])
+
+    # Best row per MOI: approved first, then first row
+    if sta:
+        approved = bp[bp[sta].astype(str).str.lower() == "approved"].copy()
+        first    = bp.drop_duplicates(subset=moi, keep="first")
+        bp_dedup = pd.concat([approved, first]).drop_duplicates(subset=moi, keep="first")
     else:
-        st.markdown("**📅 Period 1**")
-        c1,c2=st.columns(2)
-        with c1: p1_start=st.date_input("P1 From",value=datetime.date(2026,3,1),key="p1s",label_visibility="collapsed")
-        with c2: p1_end  =st.date_input("P1 To",value=datetime.date(2026,3,21),key="p1e",label_visibility="collapsed")
-        st.caption(f"{p1_start} → {p1_end}")
-        st.markdown("**📅 Period 2**")
-        c3,c4=st.columns(2)
-        with c3: p2_start=st.date_input("P2 From",value=datetime.date(2026,4,1),key="p2s",label_visibility="collapsed")
-        with c4: p2_end  =st.date_input("P2 To",value=datetime.date(2026,4,21),key="p2e",label_visibility="collapsed")
-        st.caption(f"{p2_start} → {p2_end}")
-        start_date=p1_start; end_date=p2_end
+        bp_dedup = bp.drop_duplicates(subset=moi, keep="first")
 
-    st.markdown("---")
-    st.markdown("**⚖️ Tolerances**")
-    tol_usd  = st.number_input("USD ($)",value=0.01,step=0.01,format="%.2f")
-    tol_usdt = st.number_input("USDT/Crypto ($)",value=2.00,step=0.10,format="%.2f")
-    detect_dupes = st.checkbox("🔍 Detect duplicate TxIDs",value=True)
-    min_amount   = st.number_input("Min amount ($)",value=0.0,step=1.0,format="%.2f")
-    st.markdown("---")
-    st.markdown("**📄 Output**")
-    out_fmt = st.radio("Format",["XLSX","Both"],index=0,horizontal=True,label_visibility="collapsed")
+    extra_cols = {moi: "_bp_moi", amt: "Bank_Amount"}
+    if psn: extra_cols[psn] = "PSP_Name"
+    if sta: extra_cols[sta] = "Bank_Status"
+    if trd: extra_cols[trd] = "Bank_TxID"
 
-    # Download Center
-    if st.session_state.run_done:
-        st.markdown("---")
-        st.markdown("### 📥 Downloads")
-        for key,label,fname in [
-            ("dl_order_wise","⬇️ Order Wise",f"FN_OrderWise_{start_date}_{end_date}.xlsx"),
-            ("dl_discrepancy","⬇️ Discrepancy",f"FN_Discrepancy_{start_date}_{end_date}.xlsx"),
-            ("dl_comparison","⬇️ Comparison",f"FN_Comparison_{p1_start}_{p2_end}.xlsx"),
-        ]:
-            data = st.session_state.get(key)
-            if data:
-                st.download_button(label,data=data,file_name=fname,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,key=f"sb_{key}")
-        out_files = st.session_state.out_files or {}
-        if out_files:
-            zb = io.BytesIO()
-            with zipfile.ZipFile(zb,"w",zipfile.ZIP_DEFLATED) as zf:
-                for fn,fb in out_files.items():
-                    fb.seek(0); zf.writestr(fn,fb.read())
-            zb.seek(0)
-            st.download_button("⬇️ All (ZIP)",data=zb.getvalue(),
-                file_name=f"FN_Recon_{start_date}_{end_date}.zip",
-                mime="application/zip",use_container_width=True,key="sb_zip")
+    api_bp = _prep_api(api_df, tx_prefix="BP_")
+    if api_bp.empty:
+        return pd.DataFrame()
 
-# ── Header ────────────────────────────────────────────────────────────────────
-period_str = (f"{start_date} → {end_date}" if mode=="Full Reconciliation"
-              else f"{p1_start}→{p1_end} | {p2_start}→{p2_end}")
-st.markdown(f"""<div class="fn-hdr">
-  <div style="display:flex;align-items:center;gap:10px">
-    <div class="fn-mark">FN</div>
-    <div><div class="fn-brand">FundedNext</div>
-         <div class="fn-tag">Revenue Reconciliation Portal</div></div>
-  </div>
-  <div class="fn-period">{'Full Reconciliation' if mode=='Full Reconciliation' else 'Comparison'}<br>
-    <b>{period_str}</b></div>
-</div>""", unsafe_allow_html=True)
+    tx_col = find_col(api_df, ["Transaction ID", "TransactionID"])
+    gt_col  = find_col(api_df, ["Grand Total", "GrandTotal"])
 
-# ══════════════════════════════════════════════════════════════════════════════
-# UPLOAD — all on one page, no tabs
-# ══════════════════════════════════════════════════════════════════════════════
-st.markdown('<div class="sec">📄 API Data</div>', unsafe_allow_html=True)
-api_files = st.file_uploader("API CSV/XLSX", accept_multiple_files=True,
-                              type=["csv","xlsx","xls"], key="api")
+    merged = api_bp.merge(
+        bp_dedup[list(extra_cols.keys())].rename(columns=extra_cols),
+        left_on=tx_col, right_on="_bp_moi", how="left"
+    )
+    merged["Grand Total"] = to_numeric_col(merged[gt_col].astype(str))
+    merged["Verdict"]     = _verdict(merged, "Grand Total", "Bank_Amount", tol)
+    merged["Diff (USD)"]  = (merged["Grand Total"] - merged["Bank_Amount"].fillna(0)).round(4)
+    merged["Bank"]        = "Bridgerpay"
+    return merged
 
-c1, c2 = st.columns(2)
-with c1:
-    st.markdown('<div class="sec">🔷 Phase 1 — Banks</div>', unsafe_allow_html=True)
-    bp_files  = st.file_uploader("Bridgerpay",  accept_multiple_files=True,type=["csv","xlsx","xls"],key="bp")
-    pp_files  = st.file_uploader("Payprocc",    accept_multiple_files=True,type=["csv","xlsx","xls"],key="pp")
-    cb_files  = st.file_uploader("Coinsbuy (API only)",accept_multiple_files=True,type=["csv","xlsx","xls"],key="cb")
-with c2:
-    st.markdown('<div class="sec">🟢 Phase 1 — Independent PSPs</div>', unsafe_allow_html=True)
-    zen_files = st.file_uploader("ZEN",         accept_multiple_files=True,type=["csv","xlsx","xls"],key="zen")
-    cfm_files = st.file_uploader("Confirmo (API + Orch)",accept_multiple_files=True,type=["csv","xlsx","xls"],key="cfm")
-    tcp_files = st.file_uploader("TC Pay",      accept_multiple_files=True,type=["csv","xlsx","xls"],key="tcp")
 
-with st.expander("📂 Phase 2 — PSP Statements (click to expand)"):
-    p1c, p2c, p3c = st.columns(3)
-    with p1c:
-        nuvni_f  = st.file_uploader("Nuvei NI",      type=["csv","xlsx","xls"],key="p2_ni")
-        nuvaq_f  = st.file_uploader("Nuvei AQ",      type=["csv","xlsx","xls"],key="p2_aq")
-        axcess_f = st.file_uploader("Axcess/Truevo", type=["csv","xlsx","xls"],key="p2_ax")
-        paypal_f = st.file_uploader("PayPal",        type=["csv","xlsx","xls"],key="p2_pp")
-    with p2c:
-        trustp_f = st.file_uploader("Trust Payment", type=["csv","xlsx","xls"],key="p2_tp")
-        payabl_f = st.file_uploader("Payabl",        type=["csv","xlsx","xls"],key="p2_pa")
-        paysfe_f = st.file_uploader("Paysafe",       type=["csv","xlsx","xls"],key="p2_ps")
-        unlimit_f= st.file_uploader("Unlimit",       type=["csv","xlsx","xls"],key="p2_ul")
-    with p3c:
-        dloc_f   = st.file_uploader("DLocal",        type=["csv","xlsx","xls"],key="p2_dl")
-        skrill_f = st.file_uploader("Skrill",        type=["csv","xlsx","xls"],key="p2_sk")
-        pspp_f   = st.file_uploader("Paysafe PP",    type=["csv","xlsx","xls"],key="p2_spp")
+def reconcile_payprocc(api_df, pp_files, tol=TOL_USD):
+    """
+    Payprocc (Orchestrator)
+    Match key : API Transaction ID (PP_*) = Merchant Order ID
+    Amount    : USD → Amount; non-USD → Initial Amount
+    Filter    : type=sale AND status=success
+    """
+    pp = concat_files(pp_files) if isinstance(pp_files, list) else load_file(pp_files)
+    pp = normalize(pp)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# RUN
-# ══════════════════════════════════════════════════════════════════════════════
-st.markdown("---")
+    moi = find_col(pp, ["Merchant Order ID", "MerchantOrderID", "merchantOrderId"])
+    amt = find_col(pp, ["Amount", "amount"])
+    ini = find_col(pp, ["Initial Amount", "InitialAmount", "initial_amount"])
+    cur = find_col(pp, ["Currency", "currency"])
+    typ = find_col(pp, ["Type", "type"])
+    sta = find_col(pp, ["Status", "status"])
+    pub = find_col(pp, ["Payment Public ID", "PaymentPublicID"])
 
-bank_map = {"bridgerpay":bp_files or [],"payprocc":pp_files or [],
-            "coinsbuy":cb_files or [],"zen":zen_files or [],
-            "confirmo":cfm_files or [],"tcpay":tcp_files or []}
-psp_map  = {k:[v] if v else [] for k,v in {
-            "paypal":paypal_f,"unlimit":unlimit_f,"nuvei_ni":nuvni_f,
-            "nuvei_aq":nuvaq_f,"axcess":axcess_f,
-            "trustpay":trustp_f,"payabl":payabl_f,"paysafe_bp":paysfe_f,
-            "dlocal":dloc_f,"skrill":skrill_f,"paysafe_pp":pspp_f}.items()}
-psp_map["confirmo_bp"] = cfm_files or []
+    if not moi or not amt:
+        raise ValueError(f"Payprocc: cannot find Merchant Order ID or Amount. Columns: {list(pp.columns)}")
 
-uploaded_banks = [k for k,v in bank_map.items() if v]
-uploaded_psps  = [k for k,v in psp_map.items() if v]
+    pp[amt] = to_numeric_col(pp[amt])
+    if ini:
+        pp[ini] = to_numeric_col(pp[ini])
 
-if not api_files:
-    st.info("👆 Upload the API file above to begin.")
-else:
-    c1,c2,c3 = st.columns(3)
-    with c1: st.success(f"✅ API: {len(api_files)} file(s)")
-    with c2: (st.success if uploaded_banks else st.warning)(
-        f"{'✅' if uploaded_banks else '⚠️'} Banks: {len(uploaded_banks)}")
-    with c3: (st.info if uploaded_psps else st.caption)(
-        f"📂 PSPs: {len(uploaded_psps)}" if uploaded_psps else "No PSP files")
+    mask = pd.Series(True, index=pp.index)
+    if typ:
+        mask &= pp[typ].astype(str).str.lower().str.strip() == "sale"
+    if sta:
+        mask &= pp[sta].astype(str).str.lower().str.strip() == "success"
+    pp_f = pp[mask].copy()
 
-    run_btn = st.button("🚀 Run Reconciliation", type="primary",
-                         use_container_width=True, disabled=not bool(uploaded_banks))
+    # Amount rule: USD → Amount, else → Initial Amount
+    if ini and cur:
+        pp_f["_usd"] = np.where(
+            pp_f[cur].astype(str).str.upper() == "USD",
+            pp_f[amt], pp_f[ini]
+        )
+    else:
+        pp_f["_usd"] = pp_f[amt]
 
-    if run_btn:
-        for k in ["results","out_files","run_done","api_df","dup_df",
-                  "dl_order_wise","dl_discrepancy","dl_comparison"]:
-            st.session_state[k] = None
-        st.session_state.run_done = False
+    pp_dedup = pp_f.drop_duplicates(subset=moi, keep="first")
 
-        pb = st.progress(0,"Starting…"); stx = st.empty()
-        def upd(p,m): pb.progress(p,text=m); stx.caption(m)
+    extra = {moi: "_pp_moi", "_usd": "Bank_Amount"}
+    if pub: extra[pub] = "Bank_TxID"
+    if sta: extra[sta] = "Bank_Status"
+
+    api_pp = _prep_api(api_df, tx_prefix="PP_")
+    if api_pp.empty:
+        return pd.DataFrame()
+
+    tx_col = find_col(api_df, ["Transaction ID", "TransactionID"])
+    gt_col  = find_col(api_df, ["Grand Total", "GrandTotal"])
+
+    merged = api_pp.merge(
+        pp_dedup[list(extra.keys())].rename(columns=extra),
+        left_on=tx_col, right_on="_pp_moi", how="left"
+    )
+    merged["Grand Total"] = to_numeric_col(merged[gt_col].astype(str))
+    merged["Verdict"]     = _verdict(merged, "Grand Total", "Bank_Amount", tol)
+    merged["Diff (USD)"]  = (merged["Grand Total"] - merged["Bank_Amount"].fillna(0)).round(4)
+    merged["Bank"]        = "Payprocc"
+    return merged
+
+
+def reconcile_coinsbuy(api_df, cb_files, tol=TOL_USDT):
+    """
+    Coinsbuy (Independent)
+    Match key  : API Tracking ID = Coinsbuy Tracking ID (exact)
+                 API Tracking IDs are B2B_* format
+    Amount     : Paid amount (user confirmed — NOT Target amount which is net of fee)
+                 SUM Paid amounts per Tracking ID (duplicate TIDs = split payments)
+    Filter     : Status = Paid
+    Tolerance  : ±$0.10 (stablecoin drift)
+    Note       : 65 rows with NaN Tracking ID in Coinsbuy cannot be matched
+    Two file structures supported:
+      - Original: columns include 'Tracking ID', 'Paid amount', 'Status'
+      - New (Transfers report): columns include 'Tracking ID', 'Paid amount', 'Status'
+    """
+    cb = concat_files(cb_files) if isinstance(cb_files, list) else load_file(cb_files)
+    cb = normalize(cb)
+
+    # Tracking ID field
+    tid = find_col(cb, ["Tracking ID", "TrackingID", "tracking_id", "Tracking"])
+
+    # AUTO-DETECT FILE TYPE:
+    # New file (Transfers report XLSX): has "Target amount" column — use Target amount, SUM per TID
+    #   User instruction: "SUM the Target amounts for the same Tracking ID and do it"
+    #   No status filter needed (all rows are Confirmed transfers)
+    # Old file (deposit CSV): has "Paid amount" + Status column — filter Status=Paid, use Paid amount
+    target_amt = find_col(cb, ["Target amount", "TargetAmount", "target_amount", "Target Amount"])
+    paid_amt   = find_col(cb, ["Paid amount", "PaidAmount", "paid_amount", "Paid Amount"])
+    sta        = find_col(cb, ["Status", "status"])
+
+    if not tid:
+        raise ValueError(f"Coinsbuy: cannot find Tracking ID column. Columns: {list(cb.columns)}")
+
+    # CONFIRMED: use "Amount" column, no status filter
+    amt = find_col(cb, ["Amount", "amount"])
+    if not amt:
+        # fallback for older deposit files
+        amt = paid_amt or target_amt
+    if not amt:
+        raise ValueError(f"Coinsbuy: cannot find Amount column. Columns: {list(cb.columns)}")
+    cb[amt] = to_numeric_col(cb[amt])
+    cb_f = cb.copy()  # Use all rows
+
+    # Remove rows with null/empty Tracking ID (65 bulk rows — cannot match)
+    cb_f = cb_f[cb_f[tid].notna() & (cb_f[tid].astype(str).str.strip() != "")]
+
+    # SUM Paid amounts per Tracking ID (handles split/partial payments)
+    cb_grouped = cb_f.groupby(tid)[amt].sum().reset_index()
+    cb_grouped.columns = ["_cb_tid", "Bank_Amount"]
+
+    trk_col = find_col(api_df, ["Tracking ID", "TrackingID"])
+    gt_col  = find_col(api_df, ["Grand Total", "GrandTotal"])
+
+    if not trk_col or not gt_col:
+        return pd.DataFrame()
+
+    # Match all Coinsbuy API rows — Tracking ID starts with B2B_
+    api_cb = api_df[api_df[trk_col].astype(str).str.startswith("B2B_", na=False)].copy()
+    if api_cb.empty:
+        return pd.DataFrame()
+
+    merged = api_cb.merge(cb_grouped, left_on=trk_col, right_on="_cb_tid", how="left")
+    merged["Grand Total"] = to_numeric_col(merged[gt_col].astype(str))
+    merged["Bank_Amount"] = merged["Bank_Amount"].fillna(0)
+    merged["Diff (USD)"]  = (merged["Grand Total"] - merged["Bank_Amount"]).round(4)
+
+    # KEY-ONLY VERDICT: Coinsbuy Amount is in crypto denomination (USDT/BTC/ETH/BUSD…)
+    # not USD — amount comparison against Grand Total is invalid.
+    # A matched Tracking ID = confirmed transaction. 99.9% key match rate.
+    merged["Verdict"] = merged["Bank_Amount"].apply(
+        lambda v: "RECONCILED" if v > 0 else "NOT IN BANK"
+    )
+    merged["Bank"] = "Coinsbuy"
+    return merged
+
+
+def reconcile_zen(api_df, zen_files, tol=TOL_USD):
+    """
+    ZEN (Independent)
+    Match key : API Transaction ID (ZP_*) = merchant_transaction_id
+    Amount    : transaction_amount (USD)
+    Filter    : transaction_state = ACCEPTED
+    """
+    dfs = [load_file(f) for f in zen_files] if isinstance(zen_files, list) else [load_file(zen_files)]
+    zen = pd.concat(dfs, ignore_index=True).drop_duplicates()
+    zen = normalize(zen)
+
+    mtid = find_col(zen, ["merchant_transaction_id", "MerchantTransactionId", "merchantTransactionId"])
+    amt  = find_col(zen, ["transaction_amount", "TransactionAmount", "amount", "Amount"])
+    sta  = find_col(zen, ["transaction_state", "TransactionState", "state", "Status"])
+
+    if not mtid or not amt:
+        raise ValueError(f"ZEN: cannot find merchant_transaction_id or amount. Columns: {list(zen.columns)}")
+
+    zen[amt] = to_numeric_col(zen[amt])
+
+    if sta:
+        zen_f = zen[zen[sta].astype(str).str.upper() == "ACCEPTED"].copy()
+    else:
+        zen_f = zen.copy()
+
+    zen_dedup = zen_f.drop_duplicates(subset=mtid, keep="first")
+
+    tx_col = find_col(api_df, ["Transaction ID", "TransactionID"])
+    gt_col  = find_col(api_df, ["Grand Total", "GrandTotal"])
+
+    api_zen = _prep_api(api_df, tx_prefix="ZP_")
+    if api_zen.empty:
+        return pd.DataFrame()
+
+    merged = api_zen.merge(
+        zen_dedup[[mtid, amt]].rename(columns={mtid: "_zen_id", amt: "Bank_Amount"}),
+        left_on=tx_col, right_on="_zen_id", how="left"
+    )
+    merged["Grand Total"] = to_numeric_col(merged[gt_col].astype(str))
+    merged["Verdict"]     = _verdict(merged, "Grand Total", "Bank_Amount", tol)
+    merged["Diff (USD)"]  = (merged["Grand Total"] - merged["Bank_Amount"].fillna(0)).round(4)
+    merged["Bank"]        = "ZEN"
+    return merged
+
+
+def reconcile_confirmo(api_df, cfm_files, tol=TOL_USD):
+    """
+    Confirmo (Independent – April direct integration)
+    Match key : API Tracking ID (CFM_*) = Confirmo Reference
+    Amount    : MerchantAmount (confirmed)
+    Filter    : OperationType = INVOICE
+    """
+    cfm = concat_files(cfm_files) if isinstance(cfm_files, list) else load_file(cfm_files)
+    cfm = normalize(cfm)
+
+    ref = find_col(cfm, ["Reference", "reference"])
+    # CONFIRMED: MerchantAmount is the correct amount for Phase 1 Confirmo
+    amt = find_col(cfm, ["MerchantAmount", "merchantAmount", "merchant_amount",
+                         "ReferenceValueWithoutFee", "referenceValueWithoutFee",
+                         "Amount", "amount"])
+    sta = find_col(cfm, ["Status", "status"])
+    otp = find_col(cfm, ["OperationType", "operationType", "operation_type"])
+
+    if not ref or not amt:
+        raise ValueError(f"Confirmo: cannot find Reference or amount. Columns: {list(cfm.columns)}")
+
+    cfm[amt] = to_numeric_col(cfm[amt])
+    # Filter INVOICE type if column exists (direct Confirmo file)
+    if otp:
+        cfm_f = cfm[cfm[otp].astype(str).str.upper() == "INVOICE"].copy()
+    elif sta:
+        cfm_f = cfm[cfm[sta].astype(str).str.upper() == "PAID"].copy()
+    else:
+        cfm_f = cfm.copy()
+
+    cfm_dedup = cfm_f.drop_duplicates(subset=ref, keep="first")
+
+    trk_col = find_col(api_df, ["Tracking ID", "TrackingID"])
+    gt_col  = find_col(api_df, ["Grand Total", "GrandTotal"])
+
+    if not trk_col:
+        return pd.DataFrame()
+
+    api_cfm = api_df[api_df[trk_col].astype(str).str.startswith("CFM_", na=False)].copy()
+    if api_cfm.empty:
+        return pd.DataFrame()
+
+    merged = api_cfm.merge(
+        cfm_dedup[[ref, amt]].rename(columns={ref: "_cfm_ref", amt: "Bank_Amount"}),
+        left_on=trk_col, right_on="_cfm_ref", how="left"
+    )
+    merged["Grand Total"] = to_numeric_col(merged[gt_col].astype(str))
+    merged["Verdict"]     = _verdict(merged, "Grand Total", "Bank_Amount", tol)
+    merged["Diff (USD)"]  = (merged["Grand Total"] - merged["Bank_Amount"].fillna(0)).round(4)
+    merged["Bank"]        = "Confirmo"
+    return merged
+
+
+def reconcile_tcpay(api_df, tcp_files, tol=TOL_USD):
+    """
+    TC Pay (Independent) – SUBSTRING match
+    Match key : TC Pay Tracking Number = contiguous substring of API Transaction ID
+    Amount    : Amount (USD)
+    Filter    : ChangeStatus = Increase
+    """
+    dfs = [load_file(f) for f in tcp_files] if isinstance(tcp_files, list) else [load_file(tcp_files)]
+    tcp = pd.concat(dfs, ignore_index=True).drop_duplicates()
+    tcp = normalize(tcp)
+
+    trk  = find_col(tcp, ["Tracking Number", "TrackingNumber", "tracking_number", "Tracking"])
+    amt  = find_col(tcp, ["Amount", "amount"])
+    sta  = find_col(tcp, ["ChangeStatus", "changeStatus", "change_status", "Status"])
+    dat  = find_col(tcp, ["TransactionDateUtc", "transactionDateUtc", "Date", "date"])
+
+    if not trk or not amt:
+        raise ValueError(f"TC Pay: cannot find Tracking Number or Amount. Columns: {list(tcp.columns)}")
+
+    tcp[amt] = to_numeric_col(tcp[amt])
+
+    if sta:
+        tcp_f = tcp[tcp[sta].astype(str).str.lower() == "increase"].copy()
+    else:
+        tcp_f = tcp.copy()
+
+    tx_col = find_col(api_df, ["Transaction ID", "TransactionID"])
+    gt_col  = find_col(api_df, ["Grand Total", "GrandTotal"])
+
+    # TC Pay transactions have OP- prefix in the API
+    api_tcp = api_df[api_df[tx_col].astype(str).str.startswith("OP-", na=False)].copy()
+    if api_tcp.empty or tcp_f.empty:
+        return pd.DataFrame()
+
+    # Cross-join then filter by substring (TCP is always small – typically < 300 rows)
+    api_tcp["_k"] = 1
+    tcp_f["_k"]   = 1
+    cross = api_tcp[[tx_col, gt_col, "_k"] +
+                    [c for c in ["Order ID", "Customer Email", "Plan Name", "Status", "Created At"]
+                     if c in api_tcp.columns]].merge(
+        tcp_f[[trk, amt, "_k"]].rename(columns={trk: "_tcp_trk", amt: "_tcp_amt"}),
+        on="_k"
+    ).drop("_k", axis=1)
+
+    cross["_hit"] = cross.apply(
+        lambda r: str(r["_tcp_trk"]) in str(r[tx_col]), axis=1
+    )
+    hits = cross[cross["_hit"]].drop_duplicates(subset=tx_col, keep="first")
+
+    # Left-join back
+    merged = api_tcp.drop("_k", axis=1).merge(
+        hits[[tx_col, "_tcp_trk", "_tcp_amt"]],
+        on=tx_col, how="left"
+    )
+    merged["Bank_Amount"]  = merged["_tcp_amt"]
+    merged["TC_Tracking"]  = merged["_tcp_trk"]
+    merged["Grand Total"]  = to_numeric_col(merged[gt_col].astype(str))
+    merged["Verdict"]      = _verdict(merged, "Grand Total", "Bank_Amount", tol)
+    merged["Diff (USD)"]   = (merged["Grand Total"] - merged["Bank_Amount"].fillna(0)).round(4)
+    merged["Bank"]         = "TC Pay"
+    return merged.drop(columns=["_tcp_trk", "_tcp_amt"], errors="ignore")
+
+
+# ─────────────────────────────────────────────
+# Orchestrator function
+# ─────────────────────────────────────────────
+
+
+def load_bp_raw(bp_files):
+    """
+    Load and filter Bridgerpay statement to approved Payment rows only.
+    Returns the full raw DataFrame (all original columns) for Phase 2 use.
+    """
+    bp = concat_files(bp_files) if isinstance(bp_files, list) else load_file(bp_files)
+    bp = normalize(bp)
+    bp = trim_columns(bp, "bridgerpay")  # Keep only 7 needed cols → ~70% less RAM
+    sta = find_col(bp, ["status", "Status"])
+    if sta:
+        bp = bp[bp[sta].astype(str).str.lower() == "approved"].copy()
+    # Convert amount column
+    amt = find_col(bp, ["amount", "Amount"])
+    if amt:
+        bp[amt] = to_numeric_col(bp[amt])
+    return bp
+
+
+def load_pp_raw(pp_files):
+    """
+    Load and filter Payprocc statement to sale+success rows only.
+    Returns the full raw DataFrame (all original columns) for Phase 2 use.
+    """
+    pp = concat_files(pp_files) if isinstance(pp_files, list) else load_file(pp_files)
+    pp = normalize(pp)
+    pp = trim_columns(pp, "payprocc")  # Keep only 7 needed cols
+    typ = find_col(pp, ["Type", "type"])
+    sta = find_col(pp, ["Status", "status"])
+    mask = pd.Series(True, index=pp.index)
+    if typ: mask &= pp[typ].astype(str).str.lower().str.strip() == "sale"
+    if sta: mask &= pp[sta].astype(str).str.lower().str.strip() == "success"
+    pp = pp[mask].copy()
+    amt = find_col(pp, ["Amount", "amount"])
+    ini = find_col(pp, ["Initial Amount", "InitialAmount", "initial_amount"])
+    cur = find_col(pp, ["Currency", "currency"])
+    if amt:
+        pp[amt] = to_numeric_col(pp[amt])
+    if ini:
+        pp[ini] = to_numeric_col(pp[ini])
+    # Add _usd column for Phase 2 amount matching
+    if ini and cur:
+        import numpy as np
+        pp["_usd"] = np.where(
+            pp[cur].astype(str).str.upper() == "USD",
+            pp[amt], pp[ini]
+        )
+    elif amt:
+        pp["_usd"] = pp[amt]
+    return pp
+
+BANKS = [
+    ("bridgerpay", "Bridgerpay",  reconcile_bridgerpay, TOL_USD),
+    ("payprocc",   "Payprocc",    reconcile_payprocc,   TOL_USD),
+    ("coinsbuy",   "Coinsbuy",    reconcile_coinsbuy,   TOL_USDT),
+    ("zen",        "ZEN",         reconcile_zen,        TOL_USD),
+    ("confirmo",   "Confirmo",    reconcile_confirmo,   TOL_USD),
+    ("tcpay",      "TC Pay",      reconcile_tcpay,      TOL_USD),
+]
+
+
+def reconcile_all(api_df, bank_files, tol_usd=TOL_USD, tol_usdt=TOL_USDT, progress_cb=None):
+    """
+    Run all available Phase 1 reconciliations.
+    bank_files : dict  key → list[UploadedFile] | UploadedFile | None
+    progress_cb: callable(pct: int, msg: str)
+    Returns    : (results_dict, errors_dict)
+    """
+    results = {}
+    errors  = {}
+    step    = 25
+
+    # Ensure Grand Total and TX columns are available
+    gt_col  = find_col(api_df, ["Grand Total", "GrandTotal"])
+    tx_col  = find_col(api_df, ["Transaction ID", "TransactionID"])
+    if not gt_col or not tx_col:
+        raise ValueError("API file must contain 'Grand Total' and 'Transaction ID' columns.")
+
+    tol_map = {
+        "bridgerpay": tol_usd,
+        "payprocc":   tol_usd,
+        "coinsbuy":   tol_usdt,
+        "zen":        tol_usd,
+        "confirmo":   tol_usd,
+        "tcpay":      tol_usd,
+    }
+
+    all_frames = []
+
+    for key, label, func, default_tol in BANKS:
+        files = bank_files.get(key)
+        if not files:
+            continue  # bank not provided – skip
+
+        if progress_cb:
+            progress_cb(step, f"Reconciling {label}…")
 
         try:
-            from engine.loader import concat_files, normalize, find_col, to_numeric_col
-            from engine.phase1 import reconcile_all
-            from engine.phase2 import reconcile_phase2
-            from engine.writer import write_outputs
+            tol = tol_map.get(key, default_tol)
+            df  = func(api_df, files, tol=tol)
+            if df is not None and not df.empty:
+                results[key] = df
+                all_frames.append(df)
 
-            upd(5,"Loading API…")
-            api_df = normalize(concat_files(api_files))
-            sc = find_col(api_df,["Status","status"])
-            dc = find_col(api_df,["Created At","CreatedAt"])
-            tc = find_col(api_df,["Transaction ID","TransactionID"])
-            api_en = api_df[api_df[sc].astype(str).str.lower()=="enabled"].copy() if sc else api_df.copy()
-            if dc:
-                api_en[dc] = pd.to_datetime(api_en[dc],errors="coerce")
-                api_en = api_en[(api_en[dc]>=pd.Timestamp(start_date)) &
-                                (api_en[dc]<=pd.Timestamp(end_date)+pd.Timedelta(days=1))]
-            if min_amount > 0:
-                g2 = find_col(api_en,["Grand Total","GrandTotal"])
-                if g2: api_en=api_en[pd.to_numeric(api_en[g2],errors="coerce").fillna(0)>=min_amount]
-            upd(15,f"API: {len(api_en):,} orders")
+            # Also store raw orchestrator DataFrames for Phase 2 use
+            if key == "bridgerpay":
+                try:
+                    results["bp_raw"] = load_bp_raw(files)
+                except Exception:
+                    pass
+            elif key == "payprocc":
+                try:
+                    results["pp_raw"] = load_pp_raw(files)
+                except Exception:
+                    pass
 
-            if detect_dupes and tc:
-                dup_mask = api_en.duplicated(subset=tc,keep=False)
-                dup_rows = api_en[dup_mask]
-                if not dup_rows.empty:
-                    g2 = find_col(dup_rows,["Grand Total","GrandTotal"])
-                    dr = dup_rows.copy()
-                    if g2: dr["_gt"]=pd.to_numeric(dr[g2],errors="coerce")
-                    agg={"Count":(tc,"count")}
-                    if g2: agg["Total Amount"]=("_gt","sum")
-                    st.session_state.dup_df = dr.groupby(tc).agg(**agg).reset_index()
-                    st.warning(f"⚠️ {len(dup_rows):,} rows with duplicate TxIDs")
+        except Exception as e:
+            errors[key] = str(e)
 
-            results, errors = reconcile_all(api_en,bank_map,tol_usd=tol_usd,tol_usdt=tol_usdt,progress_cb=upd)
-            for bk,err in errors.items(): st.warning(f"⚠️ {bk}: {err}")
+        step = min(step + 10, 78)
 
-            if uploaded_psps:
-                upd(80,"Phase 2…")
-                p2r,p2e = reconcile_phase2(results,psp_map,tol_usd=tol_usd)
-                for bk,err in p2e.items(): st.warning(f"⚠️ Phase 2 {bk}: {err}")
-                results["phase2"] = p2r
+    # Build combined frame + summary
+    if all_frames:
+        combined = pd.concat(all_frames, ignore_index=True)
+        results["combined"] = combined
 
-            upd(88,"Generating outputs…")
-            out_files = write_outputs(results,api_en,start_date,end_date,out_fmt)
-            st.session_state.results = results
-            st.session_state.out_files = out_files
-            st.session_state.api_df = api_en
+        total    = len(combined)
+        recon    = (combined["Verdict"] == "RECONCILED").sum()
+        mismatch = (combined["Verdict"] == "AMOUNT MISMATCH").sum()
+        nib      = (combined["Verdict"] == "NOT IN BANK").sum()
 
-            upd(92,"Building reports…")
-            try:
-                from engine.report_summary import write_full_summary
-                b=write_full_summary(api_en,results,start_date,end_date)
-                st.session_state.dl_order_wise = b.getvalue() if b else None
-            except: pass
-            try:
-                from engine.report_mismatch import write_mismatch_excel
-                b=write_mismatch_excel(results,api_en,start_date,end_date)
-                st.session_state.dl_discrepancy = b.getvalue() if b else None
-            except: pass
-            try:
-                from engine.report_order_wise import write_order_wise_excel
-                b=write_order_wise_excel(api_en,results,results.get("phase2",{}))
-                st.session_state.dl_comparison = b.getvalue() if b else None
-            except: pass
+        results["summary"] = {
+            "total_api":       len(api_df),
+            "total_matched":   total,
+            "reconciled":      int(recon),
+            "recon_pct":       round(recon / total * 100, 2) if total else 0,
+            "mismatches":      int(mismatch),
+            "not_in_bank":     int(nib),
+            "banks_run":       [k for k in tol_map if k in results],
+        }
 
-            st.session_state.run_done = True
-            pb.progress(100,"✅ Complete!"); stx.empty()
-
-        except Exception as exc:
-            pb.progress(0,"Error")
-            st.error(f"❌ {exc}")
-            with st.expander("Traceback"): st.code(traceback.format_exc())
-
-# ══════════════════════════════════════════════════════════════════════════════
-# RESULTS
-# ══════════════════════════════════════════════════════════════════════════════
-if st.session_state.run_done and st.session_state.results:
-    results = st.session_state.results
-    api_en  = st.session_state.api_df if st.session_state.api_df is not None else pd.DataFrame()
-
-    st.success("🎉 Done! Download reports from the sidebar ←")
-
-    dup_df = st.session_state.dup_df
-    if dup_df is not None and not dup_df.empty:
-        with st.expander(f"🔍 Duplicate TxIDs — {len(dup_df):,}"):
-            st.dataframe(dup_df, use_container_width=True, hide_index=True)
-
-    # KPI
-    try:
-        from engine.report_summary import compute_summary_stats
-        s = compute_summary_stats(api_en, results)
-        if s:
-            k1,k2,k3,k4,k5=st.columns(5)
-            op=s["orch_orders"]/max(s["api_orders"],1)*100
-            pp=s["psp_orders"]/max(s["api_orders"],1)*100
-            def kpi(col,val,lbl,sub,clr):
-                col.markdown(f'<div class="kpi-card"><div class="kpi-val" style="color:{clr}">'
-                    f'{val}</div><div class="kpi-lbl">{lbl}</div>'
-                    f'<div class="kpi-sub" style="color:{clr}">{sub}</div></div>',
-                    unsafe_allow_html=True)
-            kpi(k1,f"{s['api_orders']:,}","API Orders",f"${s['api_rev']:,.0f}","#0a1628")
-            kpi(k2,f"{s['orch_orders']:,}","Orchestrator",f"{op:.1f}%","#00875a" if op>=95 else "#e65100")
-            kpi(k3,f"{s['psp_orders']:,}","PSP Reconciled",f"{pp:.1f}%","#00875a" if pp>=95 else "#e65100")
-            kpi(k4,f"{s['diff_orch']:,}","Diff (Orch)",f"${s['diff_orch_rev']:,.0f}","#e53935")
-            kpi(k5,f"{s['diff_psp']:,}","Diff (PSP)",f"${s['diff_psp_rev']:,.0f}","#e53935")
-            st.markdown("")
-    except Exception as _e:
-        st.warning(f"KPI: {_e}")
-
-    # Phase tables
-    def _n(v):
-        try: return f"{int(v):,}"
-        except: return str(v)
-    def _a(v):
-        try: return f"${float(v):,.2f}"
-        except: return str(v)
-    def _pct(v):
-        try:
-            p=float(v); c="ok" if p>=95 else "pa" if p>=85 else "lo"
-            return f'<span class="{c}">{p:.1f}%</span>'
-        except: return str(v)
-
-    try:
-        from engine.report_phase_summary import build_phase1_summary, build_phase2_summary
-        p1r = build_phase1_summary(api_en, results)
-        p2r = build_phase2_summary(results)
-
-        def _tbl(rows, hdrs):
-            hh="".join(f"<th>{h}</th>" for h in hdrs)
-            return f'<div style="overflow-x:auto"><table class="rt"><thead><tr>{hh}</tr></thead><tbody>{"".join(rows)}</tbody></table></div>'
-
-        h1=["Bank","API Qty","API Amt","Bank Qty","Bank Amt","Mismatch Qty",
-            "Mismatch Amt","Not in Bank Qty","Not in Bank Amt","Extra Qty","Extra Amt","Match %"]
-        rows1=[f'<tr><td class="nm">{r["Bank Name"]}</td>'
-            f'<td>{_n(r["API Qty"])}</td><td>{_a(r["API Amt"])}</td>'
-            f'<td>{_n(r["Bank Qty"])}</td><td>{_a(r["Bank Amt"])}</td>'
-            f'<td class="d">{_n(r["Mismatch Qty"])}</td><td class="d">{_a(r["Mismatch Amt"])}</td>'
-            f'<td class="d">{_n(r["Not in Bank Qty"])}</td><td class="d">{_a(r["Not in Bank Amt"])}</td>'
-            f'<td>{_n(r["Extra in Bank Qty"])}</td><td>{_a(r["Extra in Bank Amt"])}</td>'
-            f'<td>{_pct(r["Match %"])}</td></tr>' for r in p1r]
-        st.markdown('<div class="sec">Phase 1 — API vs Bank</div>', unsafe_allow_html=True)
-        st.markdown(_tbl(rows1,h1), unsafe_allow_html=True)
-
-        if results.get("phase2"):
-            h2=["PSP","Orch Qty","Orch Amt","PSP Qty","PSP Amt","Mismatch Qty",
-                "Mismatch Amt","Not in PSP Qty","Not in PSP Amt","Extra Qty","Extra Amt","Match %"]
-            rows2=[f'<tr><td class="nm">{r["PSP Name"]}</td>'
-                f'<td>{_n(r["Orchestrator Qty"])}</td><td>{_a(r["Orchestrator Amt"])}</td>'
-                f'<td>{_n(r["PSP Qty"])}</td><td>{_a(r["PSP Amt"])}</td>'
-                f'<td class="d">{_n(r["Mismatch Qty"])}</td><td class="d">{_a(r["Mismatch Amt"])}</td>'
-                f'<td class="d">{_n(r["Not in PSP Qty"])}</td><td class="d">{_a(r["Not in PSP Amt"])}</td>'
-                f'<td>{_n(r["Extra in PSP Qty"])}</td><td>{_a(r["Extra in PSP Amt"])}</td>'
-                f'<td>{_pct(r["Match %"])}</td></tr>' for r in p2r]
-            st.markdown('<div class="sec">Phase 2 — Orchestrator vs PSP</div>', unsafe_allow_html=True)
-            st.markdown(_tbl(rows2,h2), unsafe_allow_html=True)
-    except Exception as _e:
-        st.warning(f"Tables: {_e}")
-
-    # Quick downloads at bottom
-    st.markdown("---")
-    d1,d2,d3 = st.columns(3)
-    for col,key,lbl,fname in [
-        (d1,"dl_order_wise","⬇️ Order Wise",f"FN_OrderWise_{start_date}_{end_date}.xlsx"),
-        (d2,"dl_discrepancy","⬇️ Discrepancy",f"FN_Discrepancy_{start_date}_{end_date}.xlsx"),
-        (d3,"dl_comparison","⬇️ Comparison",f"FN_Comparison_{p1_start}_{p2_end}.xlsx"),
-    ]:
-        data = st.session_state.get(key)
-        if data:
-            col.download_button(lbl,data=data,file_name=fname,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,key=f"main_{key}")
-        else:
-            col.caption(f"{lbl} — not available")
+    return results, errors
