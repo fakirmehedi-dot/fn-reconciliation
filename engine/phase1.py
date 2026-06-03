@@ -4,7 +4,7 @@ Implements all 6 gateway matching rules.
 """
 import pandas as pd
 import numpy as np
-from .loader import load_file, concat_files, normalize, find_col, to_numeric_col
+from .loader import load_file, concat_files, normalize, find_col, to_numeric_col, trim_columns
 
 TOL_USD  = 0.01
 TOL_USDT = 0.10
@@ -405,6 +405,7 @@ def load_bp_raw(bp_files):
     """
     bp = concat_files(bp_files) if isinstance(bp_files, list) else load_file(bp_files)
     bp = normalize(bp)
+    bp = trim_columns(bp, "bridgerpay")  # Keep only 7 needed cols → ~70% less RAM
     sta = find_col(bp, ["status", "Status"])
     if sta:
         bp = bp[bp[sta].astype(str).str.lower() == "approved"].copy()
@@ -422,6 +423,7 @@ def load_pp_raw(pp_files):
     """
     pp = concat_files(pp_files) if isinstance(pp_files, list) else load_file(pp_files)
     pp = normalize(pp)
+    pp = trim_columns(pp, "payprocc")  # Keep only 7 needed cols
     typ = find_col(pp, ["Type", "type"])
     sta = find_col(pp, ["Status", "status"])
     mask = pd.Series(True, index=pp.index)
