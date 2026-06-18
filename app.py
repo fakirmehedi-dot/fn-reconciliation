@@ -33,17 +33,75 @@ st.markdown("""<style>
 .kpi-val{font-size:22px;font-weight:800;color:#0a1628}
 .kpi-lbl{font-size:11px;color:#7a8aaa;margin-top:2px}
 .kpi-sub{font-size:11px;font-weight:600;margin-top:1px}
+.det-tag{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;
+         font-weight:600;margin:2px 3px}
+.det-ok{background:#e8f5e9;color:#1b5e20}
+.det-warn{background:#fff3e0;color:#9a3412}
 </style>""", unsafe_allow_html=True)
+
+
+# Theme toggle
+
+
+
+
+
+# ── Auto-detect functions ─────────────────────────────────────────────────────
+def detect_phase1(filename):
+    """Detect Phase 1 bank from filename."""
+    n = filename.lower()
+    for pattern, key in [
+        ("bridgerpay","bridgerpay"),("bp_transaction","bridgerpay"),("bp_","bridgerpay"),
+        ("payprocc","payprocc"),("pp_","payprocc"),
+        ("coinsbuy","coinsbuy"),("coins_buy","coinsbuy"),
+        ("zen_au","zen"),("zen au","zen"),("zen","zen"),
+        ("confirmo","confirmo"),
+        ("tc_pay","tcpay"),("tc pay","tcpay"),("tcpay","tcpay"),
+    ]:
+        if pattern in n:
+            return key
+    return None
+
+def detect_phase2(filename):
+    """Detect Phase 2 PSP from filename."""
+    n = filename.lower()
+    for pattern, key in [
+        ("nuvei_ni","nuvei_ni"),("nuvei ni","nuvei_ni"),("nuvei-ni","nuvei_ni"),
+        ("nuvei_aq","nuvei_aq"),("nuvei aq","nuvei_aq"),("nuvei-aq","nuvei_aq"),
+        ("nuvei","nuvei_ni"),  # default nuvei → NI
+        ("axcess","axcess"),("truevo","axcess"),
+        ("trust payment","trustpay"),("trust_payment","trustpay"),("trustpay","trustpay"),
+        ("payabl","payabl"),
+        ("paysafe","paysafe"),
+        ("paypal","paypal"),
+        ("unlimit","unlimit"),
+        ("dlocal","dlocal"),("d-local","dlocal"),
+        ("skrill","skrill"),
+        ("confirmo","confirmo_bp"),
+    ]:
+        if pattern in n:
+            return key
+    return None
+
+BANK_LABELS = {"bridgerpay":"Bridgerpay","payprocc":"Payprocc","coinsbuy":"Coinsbuy",
+               "zen":"ZEN","confirmo":"Confirmo","tcpay":"TC Pay"}
+PSP_LABELS  = {"nuvei_ni":"Nuvei NI","nuvei_aq":"Nuvei AQ","axcess":"Axcess",
+               "trustpay":"Trust Payment","payabl":"Payabl","paysafe":"Paysafe",
+               "paypal":"PayPal","unlimit":"Unlimit","dlocal":"DLocal",
+               "skrill":"Skrill","confirmo_bp":"Confirmo (BP)","zen_bp":"ZEN (BP)",
+               "paysafe_bp":"Paysafe (BP)","paysafe_pp":"Paysafe (PP)"}
 
 # ── Session state ─────────────────────────────────────────────────────────────
 for k,v in [("results",None),("out_files",None),("run_done",False),
-            ("api_df",None),("dup_df",None),
-            ("dl_order_wise",None),("dl_discrepancy",None),("dl_comparison",None)]:
+            ("api_df",None),("dup_df",None),("dup_detail",None),
+            ("dl_order_wise",None),("dl_discrepancy",None),
+            ("dl_comparison",None),("dl_psp_revenue",None),("dl_recon_gap",None),
+            ("dl_free_report",None),("free_df",None)]:
     if k not in st.session_state: st.session_state[k] = v
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("## ⚙️ Settings")
+
     mode = st.radio("Mode", ["Full Reconciliation","Comparison"], horizontal=True,
                     label_visibility="collapsed")
     st.markdown("---")
@@ -59,12 +117,10 @@ with st.sidebar:
         c1,c2=st.columns(2)
         with c1: p1_start=st.date_input("P1 From",value=datetime.date(2026,3,1),key="p1s",label_visibility="collapsed")
         with c2: p1_end  =st.date_input("P1 To",value=datetime.date(2026,3,21),key="p1e",label_visibility="collapsed")
-        st.caption(f"{p1_start} → {p1_end}")
         st.markdown("**📅 Period 2**")
         c3,c4=st.columns(2)
         with c3: p2_start=st.date_input("P2 From",value=datetime.date(2026,4,1),key="p2s",label_visibility="collapsed")
         with c4: p2_end  =st.date_input("P2 To",value=datetime.date(2026,4,21),key="p2e",label_visibility="collapsed")
-        st.caption(f"{p2_start} → {p2_end}")
         start_date=p1_start; end_date=p2_end
 
     st.markdown("---")
@@ -77,7 +133,6 @@ with st.sidebar:
     st.markdown("**📄 Output**")
     out_fmt = st.radio("Format",["XLSX","Both"],index=0,horizontal=True,label_visibility="collapsed")
 
-    # Download Center
     if st.session_state.run_done:
         st.markdown("---")
         st.markdown("### 📥 Downloads")
@@ -85,22 +140,15 @@ with st.sidebar:
             ("dl_order_wise","⬇️ Order Wise",f"FN_OrderWise_{start_date}_{end_date}.xlsx"),
             ("dl_discrepancy","⬇️ Discrepancy",f"FN_Discrepancy_{start_date}_{end_date}.xlsx"),
             ("dl_comparison","⬇️ Comparison",f"FN_Comparison_{p1_start}_{p2_end}.xlsx"),
+            ("dl_psp_revenue","⬇️ PSP Revenue",f"FN_PSP_Revenue_{start_date}_{end_date}.xlsx"),
+            ("dl_recon_gap","⬇️ Recon Gap Report",f"FN_Recon_Gap_{start_date}_{end_date}.xlsx"),
+            ("dl_free_report","⬇️ Free Accounts",f"FN_Free_Accounts_{start_date}_{end_date}.xlsx"),
         ]:
             data = st.session_state.get(key)
             if data:
                 st.download_button(label,data=data,file_name=fname,
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,key=f"sb_{key}")
-        out_files = st.session_state.out_files or {}
-        if out_files:
-            zb = io.BytesIO()
-            with zipfile.ZipFile(zb,"w",zipfile.ZIP_DEFLATED) as zf:
-                for fn,fb in out_files.items():
-                    fb.seek(0); zf.writestr(fn,fb.read())
-            zb.seek(0)
-            st.download_button("⬇️ All (ZIP)",data=zb.getvalue(),
-                file_name=f"FN_Recon_{start_date}_{end_date}.zip",
-                mime="application/zip",use_container_width=True,key="sb_zip")
 
 # ── Header ────────────────────────────────────────────────────────────────────
 period_str = (f"{start_date} → {end_date}" if mode=="Full Reconciliation"
@@ -116,75 +164,96 @@ st.markdown(f"""<div class="fn-hdr">
 </div>""", unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# UPLOAD — all on one page, no tabs
+# UPLOAD — 3 simple zones with auto-detection
 # ══════════════════════════════════════════════════════════════════════════════
 st.markdown('<div class="sec">📄 API Data</div>', unsafe_allow_html=True)
-api_files = st.file_uploader("API CSV/XLSX", accept_multiple_files=True,
+api_files = st.file_uploader("API order export (CSV/XLSX)", accept_multiple_files=True,
                               type=["csv","xlsx","xls"], key="api")
 
-c1, c2 = st.columns(2)
-with c1:
-    st.markdown('<div class="sec">🔷 Phase 1 — Banks</div>', unsafe_allow_html=True)
-    bp_files  = st.file_uploader("Bridgerpay",  accept_multiple_files=True,type=["csv","xlsx","xls"],key="bp")
-    pp_files  = st.file_uploader("Payprocc",    accept_multiple_files=True,type=["csv","xlsx","xls"],key="pp")
-    cb_files  = st.file_uploader("Coinsbuy (API only)",accept_multiple_files=True,type=["csv","xlsx","xls"],key="cb")
-with c2:
-    st.markdown('<div class="sec">🟢 Phase 1 — Independent PSPs</div>', unsafe_allow_html=True)
-    zen_files = st.file_uploader("ZEN",         accept_multiple_files=True,type=["csv","xlsx","xls"],key="zen")
-    cfm_files = st.file_uploader("Confirmo (API + Orch)",accept_multiple_files=True,type=["csv","xlsx","xls"],key="cfm")
-    tcp_files = st.file_uploader("TC Pay",      accept_multiple_files=True,type=["csv","xlsx","xls"],key="tcp")
+col1, col2 = st.columns(2)
+with col1:
+    st.markdown('<div class="sec">🔷 Phase 1 — Bank / Orchestrator Files</div>', unsafe_allow_html=True)
+    st.caption("Bridgerpay, Payprocc, Coinsbuy, ZEN, Confirmo, TC Pay")
+    p1_files = st.file_uploader("Drop all Phase 1 files", accept_multiple_files=True,
+                                 type=["csv","xlsx","xls"], key="p1_bulk")
+with col2:
+    st.markdown('<div class="sec">📂 Phase 2 — PSP Statement Files</div>', unsafe_allow_html=True)
+    st.caption("Nuvei, Axcess, Trust Payment, Payabl, Paysafe, DLocal, Skrill, PayPal, Unlimit")
+    p2_files = st.file_uploader("Drop all Phase 2 files", accept_multiple_files=True,
+                                 type=["csv","xlsx","xls"], key="p2_bulk")
 
-with st.expander("📂 Phase 2 — PSP Statements (click to expand)"):
-    p1c, p2c, p3c = st.columns(3)
-    with p1c:
-        nuvni_f  = st.file_uploader("Nuvei NI",      type=["csv","xlsx","xls"],key="p2_ni")
-        nuvaq_f  = st.file_uploader("Nuvei AQ",      type=["csv","xlsx","xls"],key="p2_aq")
-        axcess_f = st.file_uploader("Axcess/Truevo", type=["csv","xlsx","xls"],key="p2_ax")
-        paypal_f = st.file_uploader("PayPal",        type=["csv","xlsx","xls"],key="p2_pp")
-    with p2c:
-        trustp_f = st.file_uploader("Trust Payment", type=["csv","xlsx","xls"],key="p2_tp")
-        payabl_f = st.file_uploader("Payabl",        type=["csv","xlsx","xls"],key="p2_pa")
-        paysfe_f = st.file_uploader("Paysafe",       type=["csv","xlsx","xls"],key="p2_ps")
-        unlimit_f= st.file_uploader("Unlimit",       type=["csv","xlsx","xls"],key="p2_ul")
-    with p3c:
-        dloc_f   = st.file_uploader("DLocal",        type=["csv","xlsx","xls"],key="p2_dl")
-        skrill_f = st.file_uploader("Skrill",        type=["csv","xlsx","xls"],key="p2_sk")
-        pspp_f   = st.file_uploader("Paysafe PP",    type=["csv","xlsx","xls"],key="p2_spp")
+# ── Auto-detect and show results ──────────────────────────────────────────────
+bank_map = {"bridgerpay":[],"payprocc":[],"coinsbuy":[],"zen":[],"confirmo":[],"tcpay":[]}
+psp_map  = {}
+undetected_p1 = []
+undetected_p2 = []
+
+if p1_files:
+    tags = []
+    for f in p1_files:
+        key = detect_phase1(f.name)
+        if key:
+            bank_map[key].append(f)
+            tags.append(f'<span class="det-tag det-ok">{BANK_LABELS.get(key,key)}: {f.name}</span>')
+        else:
+            undetected_p1.append(f.name)
+            tags.append(f'<span class="det-tag det-warn">❓ {f.name}</span>')
+    with col1:
+        st.markdown(" ".join(tags), unsafe_allow_html=True)
+        if undetected_p1:
+            st.warning(f"Could not detect: {', '.join(undetected_p1)}")
+
+if p2_files:
+    tags = []
+    for f in p2_files:
+        key = detect_phase2(f.name)
+        if key:
+            psp_map.setdefault(key, []).append(f)
+            tags.append(f'<span class="det-tag det-ok">{PSP_LABELS.get(key,key)}: {f.name}</span>')
+        else:
+            undetected_p2.append(f.name)
+            tags.append(f'<span class="det-tag det-warn">❓ {f.name}</span>')
+    with col2:
+        st.markdown(" ".join(tags), unsafe_allow_html=True)
+        if undetected_p2:
+            st.warning(f"Could not detect: {', '.join(undetected_p2)}")
+
+# Confirmo: same file for Phase 1 + Phase 2
+if bank_map.get("confirmo"):
+    psp_map["confirmo_bp"] = bank_map["confirmo"]
+# ZEN also goes through BP — use Phase 1 ZEN files for Phase 2 matching
+if bank_map.get("zen"):
+    psp_map["zen_bp"] = bank_map["zen"]
+
+# Paysafe: same file for BP + PP scopes
+if "paysafe" in psp_map:
+    psp_map["paysafe_bp"] = psp_map["paysafe"]
+    psp_map["paysafe_pp"] = psp_map["paysafe"]
+
+uploaded_banks = [k for k,v in bank_map.items() if v]
+uploaded_psps  = [k for k,v in psp_map.items() if v]
 
 # ══════════════════════════════════════════════════════════════════════════════
 # RUN
 # ══════════════════════════════════════════════════════════════════════════════
 st.markdown("---")
 
-bank_map = {"bridgerpay":bp_files or [],"payprocc":pp_files or [],
-            "coinsbuy":cb_files or [],"zen":zen_files or [],
-            "confirmo":cfm_files or [],"tcpay":tcp_files or []}
-psp_map  = {k:[v] if v else [] for k,v in {
-            "paypal":paypal_f,"unlimit":unlimit_f,"nuvei_ni":nuvni_f,
-            "nuvei_aq":nuvaq_f,"axcess":axcess_f,
-            "trustpay":trustp_f,"payabl":payabl_f,"paysafe_bp":paysfe_f,
-            "dlocal":dloc_f,"skrill":skrill_f,"paysafe_pp":pspp_f}.items()}
-psp_map["confirmo_bp"] = cfm_files or []
-
-uploaded_banks = [k for k,v in bank_map.items() if v]
-uploaded_psps  = [k for k,v in psp_map.items() if v]
-
 if not api_files:
-    st.info("👆 Upload the API file above to begin.")
+    st.info("👆 Upload the API file to begin.")
 else:
     c1,c2,c3 = st.columns(3)
     with c1: st.success(f"✅ API: {len(api_files)} file(s)")
     with c2: (st.success if uploaded_banks else st.warning)(
-        f"{'✅' if uploaded_banks else '⚠️'} Banks: {len(uploaded_banks)}")
-    with c3: (st.info if uploaded_psps else st.caption)(
-        f"📂 PSPs: {len(uploaded_psps)}" if uploaded_psps else "No PSP files")
+        f"{'✅' if uploaded_banks else '⚠️'} Phase 1: {len(uploaded_banks)} bank(s) detected")
+    with c3: (st.success if uploaded_psps else st.caption)(
+        f"✅ Phase 2: {len(uploaded_psps)} PSP(s) detected" if uploaded_psps else "No Phase 2 files")
 
     run_btn = st.button("🚀 Run Reconciliation", type="primary",
                          use_container_width=True, disabled=not bool(uploaded_banks))
 
     if run_btn:
-        for k in ["results","out_files","run_done","api_df","dup_df",
-                  "dl_order_wise","dl_discrepancy","dl_comparison"]:
+        for k in ["results","out_files","run_done","api_df","dup_df","dup_detail",
+                  "dl_order_wise","dl_discrepancy","dl_comparison","dl_psp_revenue","dl_recon_gap","dl_free_report","free_df"]:
             st.session_state[k] = None
         st.session_state.run_done = False
 
@@ -192,17 +261,16 @@ else:
         def upd(p,m): pb.progress(p,text=m); stx.caption(m)
 
         try:
-            from engine.loader import concat_files, normalize, find_col, to_numeric_col
+            from engine.loader import concat_files, normalize, find_col, to_numeric_col, trim_columns
             from engine.phase1 import reconcile_all
             from engine.phase2 import reconcile_phase2
             from engine.writer import write_outputs
+            import gc
 
             upd(5,"Loading API…")
-            api_df = normalize(concat_files(api_files))
-            # Memory optimization: keep only needed columns
-            from engine.loader import trim_columns
-            api_df = trim_columns(api_df, "api")
-            import gc; gc.collect()
+            api_df = normalize(concat_files(api_files, file_type="api"))
+            gc.collect()
+
             sc = find_col(api_df,["Status","status"])
             dc = find_col(api_df,["Created At","CreatedAt"])
             tc = find_col(api_df,["Transaction ID","TransactionID"])
@@ -214,21 +282,68 @@ else:
             if min_amount > 0:
                 g2 = find_col(api_en,["Grand Total","GrandTotal"])
                 if g2: api_en=api_en[pd.to_numeric(api_en[g2],errors="coerce").fillna(0)>=min_amount]
+
+            # ── Exclude free accounts from reconciliation ─────────────────
+            FREE_TYPES = [
+                "100% discount account",
+                "free account",
+                "free account (affiliate/partners)",
+                "internal testing",
+                "competition free account",
+                "giveaway account (external)",
+            ]
+            # Search multiple columns for free account indicators
+            free_mask = pd.Series(False, index=api_en.index)
+            for col_name in ["Gateway","gateway","Account Type","AccountType",
+                             "Order Type","OrderType","Plan Type","PlanType"]:
+                col = find_col(api_en, [col_name])
+                if col:
+                    free_mask = free_mask | api_en[col].astype(str).str.lower().str.strip().isin(FREE_TYPES)
+
+            free_df = api_en[free_mask].copy()
+            api_en  = api_en[~free_mask].copy()
+
+            if not free_df.empty:
+                st.session_state.free_df = free_df
+            else:
+                st.session_state.free_df = pd.DataFrame()
             upd(15,f"API: {len(api_en):,} orders")
+            del api_df; gc.collect()
 
             if detect_dupes and tc:
                 dup_mask = api_en.duplicated(subset=tc,keep=False)
-                dup_rows = api_en[dup_mask]
+                dup_rows = api_en[dup_mask].copy()
                 if not dup_rows.empty:
                     g2 = find_col(dup_rows,["Grand Total","GrandTotal"])
-                    dr = dup_rows.copy()
-                    if g2: dr["_gt"]=pd.to_numeric(dr[g2],errors="coerce")
-                    agg={"Count":(tc,"count")}
-                    if g2: agg["Total Amount"]=("_gt","sum")
-                    st.session_state.dup_df = dr.groupby(tc).agg(**agg).reset_index()
-                    st.warning(f"⚠️ {len(dup_rows):,} rows with duplicate TxIDs")
+                    if g2: dup_rows["_gt"]=pd.to_numeric(dup_rows[g2],errors="coerce")
+                    agg_dict = {"Count":(tc,"count")}
+                    if g2:
+                        agg_dict["Total Amount"]=("_gt","sum")
+                        agg_dict["Min Amount"]=("_gt","min")
+                        agg_dict["Max Amount"]=("_gt","max")
+                    dup_summary = dup_rows.groupby(tc).agg(**agg_dict).reset_index()
+                    dup_summary["Same Amount?"] = dup_summary.apply(
+                        lambda r: "✅ Yes" if r.get("Min Amount",0)==r.get("Max Amount",0) else "❌ No", axis=1)
+                    dup_summary = dup_summary.sort_values("Count",ascending=False)
+                    st.session_state.dup_df = dup_summary
+
+                    detail_cols = [c for c in [tc,g2,
+                        find_col(dup_rows,["Created At","CreatedAt"]),
+                        find_col(dup_rows,["Plan Type","PlanType"]),
+                        find_col(dup_rows,["Order ID","OrderID"]),
+                        find_col(dup_rows,["Customer Email","CustomerEmail"]),
+                        find_col(dup_rows,["Gateway","gateway"]),
+                        find_col(dup_rows,["Status","status"]),
+                    ] if c and c in dup_rows.columns]
+                    st.session_state.dup_detail = dup_rows[detail_cols].sort_values(tc)
+
+                    unique_dups = len(dup_summary)
+                    total_dup_rows = len(dup_rows)
+                    dup_amt = dup_rows["_gt"].sum() if g2 else 0
+                    st.warning(f"⚠️ {total_dup_rows:,} rows with {unique_dups:,} duplicate TxIDs (${dup_amt:,.0f})")
 
             results, errors = reconcile_all(api_en,bank_map,tol_usd=tol_usd,tol_usdt=tol_usdt,progress_cb=upd)
+            gc.collect()
             for bk,err in errors.items(): st.warning(f"⚠️ {bk}: {err}")
 
             if uploaded_psps:
@@ -238,7 +353,35 @@ else:
                 results["phase2"] = p2r
 
             upd(88,"Generating outputs…")
+            # Cross-reference duplicates with Orchestrator/PSP results
+            if st.session_state.dup_df is not None and tc:
+                try:
+                    dup_summary = st.session_state.dup_df
+                    orch_ids = set()
+                    combined = results.get("combined", pd.DataFrame())
+                    if not combined.empty:
+                        ctid = find_col(combined, ["Transaction ID","TransactionID"])
+                        ctrk = find_col(combined, ["Tracking ID","TrackingID"])
+                        if ctid: orch_ids.update(combined[ctid].dropna().tolist())
+                        if ctrk: orch_ids.update(combined[ctrk].dropna().tolist())
+                    psp_ids = set()
+                    for pkey, pdf in results.get("phase2", {}).items():
+                        if isinstance(pdf, pd.DataFrame) and not pdf.empty:
+                            atid = find_col(pdf, ["_api_tid","merchantOrderId","Merchant Order ID",
+                                                   "Payment Public ID"])
+                            if atid: psp_ids.update(pdf[atid].dropna().astype(str).tolist())
+                    def _source(tid):
+                        in_orch = tid in orch_ids
+                        in_psp  = tid in psp_ids
+                        if in_orch and in_psp: return "API + Orch + PSP"
+                        elif in_orch:          return "API + Orch"
+                        elif in_psp:           return "API + PSP"
+                        else:                  return "API Only"
+                    dup_summary["Source"] = dup_summary[tc].apply(_source)
+                    st.session_state.dup_df = dup_summary
+                except Exception: pass
             out_files = write_outputs(results,api_en,start_date,end_date,out_fmt)
+            gc.collect()
             st.session_state.results = results
             st.session_state.out_files = out_files
             st.session_state.api_df = api_en
@@ -248,17 +391,63 @@ else:
                 from engine.report_summary import write_full_summary
                 b=write_full_summary(api_en,results,start_date,end_date)
                 st.session_state.dl_order_wise = b.getvalue() if b else None
-            except: pass
+            except Exception as e:
+                import traceback
+                st.warning(f"⚠️ Order Wise: {e}")
+                st.code(traceback.format_exc())
             try:
                 from engine.report_mismatch import write_mismatch_excel
                 b=write_mismatch_excel(results,api_en,start_date,end_date)
                 st.session_state.dl_discrepancy = b.getvalue() if b else None
-            except: pass
+            except Exception as e: st.warning(f"⚠️ Discrepancy: {e}")
             try:
                 from engine.report_order_wise import write_order_wise_excel
                 b=write_order_wise_excel(api_en,results,results.get("phase2",{}))
                 st.session_state.dl_comparison = b.getvalue() if b else None
-            except: pass
+            except Exception as e: st.warning(f"⚠️ Comparison: {e}")
+            try:
+                from engine.report_psp_revenue import write_psp_revenue_excel
+                b=write_psp_revenue_excel(api_en,results,start_date,end_date)
+                st.session_state.dl_psp_revenue = b.getvalue() if b else None
+            except Exception as e: st.warning(f"⚠️ PSP Revenue: {e}")
+            try:
+                from engine.report_recon_gap import build_recon_gap_report
+                b=build_recon_gap_report(api_en,results,start_date,end_date)
+                st.session_state.dl_recon_gap = b.getvalue() if b else None
+            except Exception as e: st.warning(f"⚠️ Recon Gap: {e}")
+            # Free Account Report
+            try:
+                free_df = st.session_state.get("free_df", pd.DataFrame())
+                if not free_df.empty:
+                    fb = io.BytesIO()
+                    with pd.ExcelWriter(fb, engine="xlsxwriter") as writer:
+                        # Sheet 1: All free account records
+                        keep = [c for c in [
+                            find_col(free_df,["Transaction ID","TransactionID"]),
+                            find_col(free_df,["Tracking ID","TrackingID"]),
+                            find_col(free_df,["Order ID","OrderID"]),
+                            find_col(free_df,["Grand Total","GrandTotal"]),
+                            find_col(free_df,["Plan Type","PlanType"]),
+                            find_col(free_df,["Gateway","gateway"]),
+                            find_col(free_df,["Account Type","AccountType"]),
+                            find_col(free_df,["Order Type","OrderType"]),
+                            find_col(free_df,["Customer Email","CustomerEmail"]),
+                            find_col(free_df,["Created At","CreatedAt"]),
+                            find_col(free_df,["Status","status"]),
+                        ] if c and c in free_df.columns]
+                        free_df[keep].to_excel(writer, sheet_name="All Free Accounts", index=False)
+                        # Sheet 2: Count by type
+                        for col_name in ["Gateway","Account Type","Order Type","Plan Type"]:
+                            col = find_col(free_df, [col_name])
+                            if col:
+                                vc = free_df[col].value_counts().reset_index()
+                                vc.columns = ["Type", "Count"]
+                                vc.loc[len(vc)] = ["TOTAL", vc["Count"].sum()]
+                                vc.to_excel(writer, sheet_name="Count by Type", index=False)
+                                break
+                    fb.seek(0)
+                    st.session_state.dl_free_report = fb.getvalue()
+            except Exception as e: st.warning(f"⚠️ Free Account Report: {e}")
 
             st.session_state.run_done = True
             pb.progress(100,"✅ Complete!"); stx.empty()
@@ -279,10 +468,58 @@ if st.session_state.run_done and st.session_state.results:
 
     dup_df = st.session_state.dup_df
     if dup_df is not None and not dup_df.empty:
-        with st.expander(f"🔍 Duplicate TxIDs — {len(dup_df):,}"):
+        unique_dups = len(dup_df)
+        total_rows  = int(dup_df["Count"].sum())
+        st.markdown('<div class="sec">🔍 Duplicate Transaction IDs</div>', unsafe_allow_html=True)
+        with st.expander(f"⚠️ {unique_dups:,} duplicate TxIDs found ({total_rows:,} rows) — click to view", expanded=True):
+            c1,c2,c3,c4 = st.columns(4)
+            c1.metric("Unique Duplicate IDs", f"{unique_dups:,}")
+            c2.metric("Total Duplicate Rows", f"{total_rows:,}")
+            same_amt = (dup_df["Same Amount?"]=="✅ Yes").sum() if "Same Amount?" in dup_df.columns else 0
+            c3.metric("Same Amount", f"{same_amt:,}", help="Exact duplicates")
+            c4.metric("Diff Amount", f"{unique_dups - same_amt:,}", help="Same TxID, different amount")
+
+            # Source breakdown
+            if "Source" in dup_df.columns:
+                st.markdown("**Where were duplicates found?**")
+                src_counts = dup_df["Source"].value_counts()
+                sc1,sc2,sc3,sc4 = st.columns(4)
+                sc1.metric("API Only", f"{src_counts.get('API Only',0):,}",
+                           help="Duplicate in API but not in Orchestrator or PSP")
+                sc2.metric("API + Orch", f"{src_counts.get('API + Orch',0):,}",
+                           help="Duplicate exists in both API and Orchestrator")
+                sc3.metric("API + Orch + PSP", f"{src_counts.get('API + Orch + PSP',0):,}",
+                           help="Duplicate exists in API, Orchestrator, and PSP")
+                sc4.metric("API + PSP", f"{src_counts.get('API + PSP',0):,}",
+                           help="Duplicate in API and PSP but not Orchestrator")
+
             st.dataframe(dup_df, use_container_width=True, hide_index=True)
 
-    # KPI
+            dup_detail = st.session_state.get("dup_detail")
+            if dup_detail is not None and not dup_detail.empty:
+                if st.checkbox("Show all duplicate rows (detail)", key="show_dup_detail"):
+                    st.dataframe(dup_detail, use_container_width=True, hide_index=True)
+
+            # Download duplicate report
+            try:
+                dup_buf = io.BytesIO()
+                with pd.ExcelWriter(dup_buf, engine="xlsxwriter") as writer:
+                    dup_df.to_excel(writer, sheet_name="Summary", index=False)
+                    if dup_detail is not None and not dup_detail.empty:
+                        dup_detail.to_excel(writer, sheet_name="Detail", index=False)
+                    if "Source" in dup_df.columns:
+                        src = dup_df["Source"].value_counts().reset_index()
+                        src.columns = ["Source","Count"]
+                        src.to_excel(writer, sheet_name="Source Breakdown", index=False)
+                dup_buf.seek(0)
+                st.download_button("⬇️ Download Duplicate TxID Report",
+                    data=dup_buf.getvalue(),
+                    file_name=f"FN_Duplicate_TxIDs_{start_date}_{end_date}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True, key="dl_dup_report")
+            except Exception as e:
+                st.warning(f"⚠️ Duplicate report: {e}")
+
     try:
         from engine.report_summary import compute_summary_stats
         s = compute_summary_stats(api_en, results)
@@ -296,15 +533,18 @@ if st.session_state.run_done and st.session_state.results:
                     f'<div class="kpi-sub" style="color:{clr}">{sub}</div></div>',
                     unsafe_allow_html=True)
             kpi(k1,f"{s['api_orders']:,}","API Orders",f"${s['api_rev']:,.0f}","#0a1628")
-            kpi(k2,f"{s['orch_orders']:,}","Orchestrator",f"{op:.1f}%","#00875a" if op>=95 else "#e65100")
-            kpi(k3,f"{s['psp_orders']:,}","PSP Reconciled",f"{pp:.1f}%","#00875a" if pp>=95 else "#e65100")
+            kpi(k2,f"{s['orch_orders']:,}","Orchestrator",f"{op:.1f}% · ${s['orch_rev']:,.0f}","#00875a" if op>=95 else "#e65100")
+            kpi(k3,f"{s['psp_orders']:,}","PSP Reconciled",f"{pp:.1f}% · ${s['psp_rev']:,.0f}","#00875a" if pp>=95 else "#e65100")
             kpi(k4,f"{s['diff_orch']:,}","Diff (Orch)",f"${s['diff_orch_rev']:,.0f}","#e53935")
             kpi(k5,f"{s['diff_psp']:,}","Diff (PSP)",f"${s['diff_psp_rev']:,.0f}","#e53935")
+            # Free account excluded info
+            free_df = st.session_state.get("free_df", pd.DataFrame())
+            if not free_df.empty:
+                st.info(f"ℹ️ {len(free_df):,} free accounts excluded from reconciliation (100% Discount, Free Account, Internal Testing, etc.)")
             st.markdown("")
     except Exception as _e:
         st.warning(f"KPI: {_e}")
 
-    # Phase tables
     def _n(v):
         try: return f"{int(v):,}"
         except: return str(v)
@@ -353,13 +593,16 @@ if st.session_state.run_done and st.session_state.results:
     except Exception as _e:
         st.warning(f"Tables: {_e}")
 
-    # Quick downloads at bottom
+    # Downloads at bottom
     st.markdown("---")
-    d1,d2,d3 = st.columns(3)
+    d1,d2,d3,d4,d5,d6 = st.columns(6)
     for col,key,lbl,fname in [
         (d1,"dl_order_wise","⬇️ Order Wise",f"FN_OrderWise_{start_date}_{end_date}.xlsx"),
         (d2,"dl_discrepancy","⬇️ Discrepancy",f"FN_Discrepancy_{start_date}_{end_date}.xlsx"),
         (d3,"dl_comparison","⬇️ Comparison",f"FN_Comparison_{p1_start}_{p2_end}.xlsx"),
+        (d4,"dl_psp_revenue","⬇️ PSP Revenue",f"FN_PSP_Revenue_{start_date}_{end_date}.xlsx"),
+        (d5,"dl_recon_gap","⬇️ Recon Gap",f"FN_Recon_Gap_{start_date}_{end_date}.xlsx"),
+        (d6,"dl_free_report","⬇️ Free Accounts",f"FN_Free_Accounts_{start_date}_{end_date}.xlsx"),
     ]:
         data = st.session_state.get(key)
         if data:

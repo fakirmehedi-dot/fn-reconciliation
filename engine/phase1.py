@@ -96,7 +96,7 @@ def reconcile_payprocc(api_df, pp_files, tol=TOL_USD):
     """
     Payprocc (Orchestrator)
     Match key : API Transaction ID (PP_*) = Merchant Order ID
-    Amount    : USD → Amount; non-USD → Initial Amount
+    Amount    : USD → Amount; non-USD → Applied Amount
     Filter    : type=sale AND status=success
     """
     pp = concat_files(pp_files) if isinstance(pp_files, list) else load_file(pp_files)
@@ -104,7 +104,8 @@ def reconcile_payprocc(api_df, pp_files, tol=TOL_USD):
 
     moi = find_col(pp, ["Merchant Order ID", "MerchantOrderID", "merchantOrderId"])
     amt = find_col(pp, ["Amount", "amount"])
-    ini = find_col(pp, ["Initial Amount", "InitialAmount", "initial_amount"])
+    ini = find_col(pp, ["Applied Amount", "AppliedAmount", "applied_amount",
+                         "Initial Amount", "InitialAmount", "initial_amount"])
     cur = find_col(pp, ["Currency", "currency"])
     typ = find_col(pp, ["Type", "type"])
     sta = find_col(pp, ["Status", "status"])
@@ -332,8 +333,8 @@ def reconcile_confirmo(api_df, cfm_files, tol=TOL_USD):
 
 def reconcile_tcpay(api_df, tcp_files, tol=TOL_USD):
     """
-    TC Pay (Independent) – SUBSTRING match
-    Match key : TC Pay Tracking Number = contiguous substring of API Transaction ID
+    TC Pay (Independent)
+    Match key : TC Pay Tracking Number = API Transaction ID (exact or substring)
     Amount    : Amount (USD)
     Filter    : ChangeStatus = Increase
     """
@@ -344,53 +345,88 @@ def reconcile_tcpay(api_df, tcp_files, tol=TOL_USD):
     trk  = find_col(tcp, ["Tracking Number", "TrackingNumber", "tracking_number", "Tracking"])
     amt  = find_col(tcp, ["Amount", "amount"])
     sta  = find_col(tcp, ["ChangeStatus", "changeStatus", "change_status", "Status"])
-    dat  = find_col(tcp, ["TransactionDateUtc", "transactionDateUtc", "Date", "date"])
 
     if not trk or not amt:
         raise ValueError(f"TC Pay: cannot find Tracking Number or Amount. Columns: {list(tcp.columns)}")
 
     tcp[amt] = to_numeric_col(tcp[amt])
+    # Strip whitespace from Tracking Number
+    tcp[trk] = tcp[trk].astype(str).str.strip()
 
     if sta:
         tcp_f = tcp[tcp[sta].astype(str).str.lower() == "increase"].copy()
     else:
         tcp_f = tcp.copy()
 
-    tx_col = find_col(api_df, ["Transaction ID", "TransactionID"])
-    gt_col  = find_col(api_df, ["Grand Total", "GrandTotal"])
-
-    # TC Pay transactions have OP- prefix in the API
-    api_tcp = api_df[api_df[tx_col].astype(str).str.startswith("OP-", na=False)].copy()
-    if api_tcp.empty or tcp_f.empty:
+    if tcp_f.empty:
         return pd.DataFrame()
 
-    # Cross-join then filter by substring (TCP is always small – typically < 300 rows)
-    api_tcp["_k"] = 1
-    tcp_f["_k"]   = 1
-    cross = api_tcp[[tx_col, gt_col, "_k"] +
-                    [c for c in ["Order ID", "Customer Email", "Plan Name", "Status", "Created At"]
-                     if c in api_tcp.columns]].merge(
-        tcp_f[[trk, amt, "_k"]].rename(columns={trk: "_tcp_trk", amt: "_tcp_amt"}),
-        on="_k"
-    ).drop("_k", axis=1)
+    tx_col = find_col(api_df, ["Transaction ID", "TransactionID"])
+    gt_col = find_col(api_df, ["Grand Total", "GrandTotal"])
 
-    cross["_hit"] = cross.apply(
-        lambda r: str(r["_tcp_trk"]) in str(r[tx_col]), axis=1
-    )
-    hits = cross[cross["_hit"]].drop_duplicates(subset=tx_col, keep="first")
+    # Build lookup: TC Pay Tracking Number → (amount, row)
+    tcp_lookup = {}
+    for _, r in tcp_f.iterrows():
+        k = str(r[trk]).strip()
+        if k and k != "nan":
+            tcp_lookup[k] = float(r[amt]) if pd.notna(r[amt]) else 0.0
 
-    # Left-join back
-    merged = api_tcp.drop("_k", axis=1).merge(
-        hits[[tx_col, "_tcp_trk", "_tcp_amt"]],
-        on=tx_col, how="left"
-    )
-    merged["Bank_Amount"]  = merged["_tcp_amt"]
-    merged["TC_Tracking"]  = merged["_tcp_trk"]
-    merged["Grand Total"]  = to_numeric_col(merged[gt_col].astype(str))
-    merged["Verdict"]      = _verdict(merged, "Grand Total", "Bank_Amount", tol)
-    merged["Diff (USD)"]   = (merged["Grand Total"] - merged["Bank_Amount"].fillna(0)).round(4)
-    merged["Bank"]         = "TC Pay"
-    return merged.drop(columns=["_tcp_trk", "_tcp_amt"], errors="ignore")
+    # Try matching each API Transaction ID against TC Pay
+    # Strategy 1: exact match (API TxID == TC Pay Tracking Number)
+    # Strategy 2: TC Pay Tracking Number is substring of API TxID
+    # Strategy 3: API TxID is substring of TC Pay Tracking Number
+    api_copy = api_df.copy()
+    api_copy["_tcp_trk"] = None
+    api_copy["_tcp_amt"] = None
+
+    tcp_keys = set(tcp_lookup.keys())
+
+    for idx, row in api_copy.iterrows():
+        tid = str(row.get(tx_col, "")).strip()
+        if not tid or tid == "nan":
+            continue
+
+        # Exact match
+        if tid in tcp_keys:
+            api_copy.at[idx, "_tcp_trk"] = tid
+            api_copy.at[idx, "_tcp_amt"] = tcp_lookup[tid]
+            continue
+
+        # Substring: TC Pay tracking in API TxID
+        for tk in tcp_keys:
+            if tk in tid:
+                api_copy.at[idx, "_tcp_trk"] = tk
+                api_copy.at[idx, "_tcp_amt"] = tcp_lookup[tk]
+                tcp_keys.discard(tk)  # prevent double-matching
+                break
+
+        # Substring: API TxID in TC Pay tracking
+        if api_copy.at[idx, "_tcp_trk"] is None:
+            for tk in tcp_keys:
+                if tid in tk:
+                    api_copy.at[idx, "_tcp_trk"] = tk
+                    api_copy.at[idx, "_tcp_amt"] = tcp_lookup[tk]
+                    tcp_keys.discard(tk)
+                    break
+
+    matched = api_copy[api_copy["_tcp_trk"].notna()].copy()
+    unmatched_api = api_copy[api_copy["_tcp_trk"].isna()]
+
+    if matched.empty:
+        # No matches found — return empty result with proper structure
+        return pd.DataFrame()
+
+    matched[gt_col] = to_numeric_col(matched[gt_col])
+    matched["_tcp_amt"] = pd.to_numeric(matched["_tcp_amt"], errors="coerce")
+    matched["Diff (USD)"] = (matched[gt_col] - matched["_tcp_amt"]).round(2)
+    matched["Bank"] = "TC Pay"
+
+    def _verdict(diff):
+        if pd.isna(diff): return "NOT IN BANK"
+        return "RECONCILED" if abs(diff) <= tol else "AMOUNT MISMATCH"
+
+    matched["Verdict"] = matched["Diff (USD)"].apply(_verdict)
+    return matched
 
 
 # ─────────────────────────────────────────────

@@ -34,18 +34,35 @@ def _match(psp_df, psp_key, psp_amt,
     """
     Core match: LEFT JOIN from PSP (base) → Orchestrator.
     Every PSP row appears once. BP/PP amount pulled in where key matches.
+    _api_tid is added to enable API Grand Total lookup in PSP Revenue report.
     """
     psp_d = psp_df.drop_duplicates(subset=psp_key, keep="first")
     psp_d = psp_d.copy()
     psp_d["_psp_amt"] = to_numeric_col(psp_d[psp_amt].astype(str))
 
-    orch_sub = orch_df[[orch_key, orch_amt]].drop_duplicates(subset=orch_key, keep="first").copy()
+    # Build orch lookup: include merchantOrderId/Payment Public ID alongside amount
+    # so we can map _ok (transactionId/pspOrderId) back to the API TID
+    orch_moi = find_col(orch_df, ["merchantOrderId","merchant_order_id","MerchantOrderID",
+                                   "Payment Public ID","PaymentPublicID"])
+    orch_keep = [orch_key, orch_amt]
+    if orch_moi and orch_moi != orch_key:
+        orch_keep.append(orch_moi)
+    orch_sub = orch_df[orch_keep].drop_duplicates(subset=orch_key, keep="first").copy()
     orch_sub["_orch_amt"] = to_numeric_col(orch_sub[orch_amt].astype(str))
 
+    rename_map = {orch_key: "_ok"}
+    if orch_moi and orch_moi != orch_key:
+        rename_map[orch_moi] = "_api_tid"
+
     m = psp_d.merge(
-        orch_sub[[orch_key, "_orch_amt"]].rename(columns={orch_key: "_ok"}),
+        orch_sub[[orch_key] + ([orch_moi] if orch_moi and orch_moi != orch_key else []) + ["_orch_amt"]]
+            .rename(columns=rename_map),
         left_on=psp_key, right_on="_ok", how="left"
     )
+    # If orch_key IS merchantOrderId (e.g. Nuvei, Axcess), _ok itself is the API TID
+    if "_api_tid" not in m.columns:
+        m["_api_tid"] = m["_ok"]
+
     m["PSP_Amount"]  = m["_psp_amt"]
     m["Orch_Amount"] = m["_orch_amt"]
     m["Verdict"]     = _verdict_psp_base(m, "PSP_Amount", "Orch_Amount", tol)
@@ -59,14 +76,18 @@ def _match(psp_df, psp_key, psp_amt,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def recon_paypal(bp_df, files, tol=TOL):
-    """PayPal: BP transactionId = PayPal Transaction ID | Gross"""
+    """
+    PayPal:
+    Match: PayPal Transaction ID = BP transactionId
+    Amount: Gross
+    """
     psp = _load_psp(files)
     if psp.empty: return pd.DataFrame()
     tid = find_col(psp, ["Transaction ID","TransactionID","transaction_id"])
     amt = find_col(psp, ["Gross","gross"])
     if not tid or not amt:
         raise ValueError(f"PayPal: need 'Transaction ID'+'Gross'. Columns: {list(psp.columns)}")
-    tx_col = find_col(bp_df, ["transactionId","transaction_id","TransactionID"])
+    tx_col = find_col(bp_df, ["transactionId","transaction_id","TransactionId"])
     a_col  = find_col(bp_df, ["amount","Amount"])
     if not tx_col or not a_col: return pd.DataFrame()
     return _match(psp, tid, amt, bp_df, tx_col, a_col, "PayPal", tol)
@@ -87,6 +108,36 @@ def recon_unlimit(bp_df, files, tol=TOL):
     a_col = find_col(bp_df, ["amount","Amount"])
     if not bpkey or not a_col: return pd.DataFrame()
     return _match(psp, pid, amt, bp_df, bpkey, a_col, "Unlimit", tol)
+
+
+def recon_zen_bp(bp_df, zen_files, tol=TOL):
+    """
+    ZEN through Bridgerpay (Phase 2)
+    Match: ZEN transaction_id = BP pspOrderId
+    Amount: ZEN transaction_amount vs BP amount
+    Base: BP rows where pspName = Zen
+    """
+    psp = _load_psp(zen_files)
+    if psp.empty: return pd.DataFrame()
+
+    zen_tid = find_col(psp, ["transaction_id", "TransactionId", "Transaction ID"])
+    zen_amt = find_col(psp, ["transaction_amount", "TransactionAmount"])
+    if not zen_tid or not zen_amt:
+        raise ValueError(f"ZEN(BP): need 'transaction_id'+'transaction_amount'. Columns: {list(psp.columns)}")
+
+    bp_poi = find_col(bp_df, ["pspOrderId", "psp_order_id"])
+    bp_amt = find_col(bp_df, ["amount", "Amount"])
+    if not bp_poi or not bp_amt: return pd.DataFrame()
+
+    # Scope BP to Zen rows only
+    psp_name = find_col(bp_df, ["pspName", "psp_name"])
+    if psp_name:
+        bp_zen = bp_df[bp_df[psp_name].astype(str).str.lower() == "zen"].copy()
+    else:
+        bp_zen = bp_df.copy()
+
+    if bp_zen.empty: return pd.DataFrame()
+    return _match(psp, zen_tid, zen_amt, bp_zen, bp_poi, bp_amt, "ZEN (BP)", tol)
 
 
 def recon_nuvei(bp_df, files, label, tol=TOL):
@@ -163,11 +214,9 @@ def recon_axcess(bp_df, files, tol=TOL):
 def recon_confirmo_bp(bp_df, files, tol=TOL):
     """
     Confirmo Phase 2 — Bridgerpay vs Confirmo
-    April: Confirmo is independent PSP — same file used for BOTH Phase 1 (API) and Phase 2 (Orchestrator).
-    March: Confirmo goes through Bridgerpay.
-
-    CONFIRMED match key: BP 'id' = Confirmo 'Reference'
+    CONFIRMED: BP 'id' = Confirmo 'Reference'
     Amount: Confirmo MerchantAmount vs BP amount
+    Base: BP rows scoped to those with matching Confirmo References (not all 191K)
     """
     psp = _load_psp(files)
     if psp.empty: return pd.DataFrame()
@@ -179,14 +228,22 @@ def recon_confirmo_bp(bp_df, files, tol=TOL):
     psp_d = psp.drop_duplicates(subset=ref, keep="first")
     bp_id = find_col(bp_df, ["id","Id","ID"])
     a_col = find_col(bp_df, ["amount","Amount"])
+    moi   = find_col(bp_df, ["merchantOrderId","merchant_order_id"])
     if not bp_id or not a_col: return pd.DataFrame()
-    m = bp_df[[bp_id, a_col]].merge(
+
+    # Scope BP to only rows where id appears in Confirmo References
+    cfm_refs = set(psp_d[ref].dropna())
+    bp_scope = bp_df[bp_df[bp_id].isin(cfm_refs)].copy()
+    if bp_scope.empty: return pd.DataFrame()
+
+    m = bp_scope[[bp_id, a_col] + ([moi] if moi else [])].merge(
         psp_d[[ref, amt]].rename(columns={ref:"_k", amt:"PSP_Amount"}),
         left_on=bp_id, right_on="_k", how="left")
     m["Orch_Amount"] = to_numeric_col(m[a_col].astype(str))
     m["Verdict"]     = _verdict_psp_base(m, "PSP_Amount", "Orch_Amount", tol)
     m["Diff (USD)"]  = (m["PSP_Amount"].fillna(0) - m["Orch_Amount"].fillna(0)).round(4)
     m["PSP"]         = "Confirmo (via BP)"
+    if moi: m["_api_tid"] = m[moi]
     return m
 
 def recon_trustpayment(bp_df, files, tol=TOL):
@@ -238,18 +295,17 @@ def recon_trustpayment(bp_df, files, tol=TOL):
 def recon_payabl(bp_df, files, tol=TOL):
     """
     Payabl:
-    VERIFIED: PSP 'Tx-Id' = BP 'transactionId' → 50,616 matches
+    Match: PSP 'Transaction ID' = BP 'transactionId'
     Amount: Amount | No filter (all Successful Captures)
     """
     psp = _load_psp(files)
     if psp.empty: return pd.DataFrame()
-    # CONFIRMED: Custom 3 = BP merchantOrderId (from conversation)
-    pid = find_col(psp, ["Custom 3","Custom3","custom_3","custom3","CustomField3"])
+    pid = find_col(psp, ["Transaction ID","TransactionID","transaction_id",
+                          "Tx-Id","TxId","tx_id"])
     amt = find_col(psp, ["Amount","amount"])
     if not pid or not amt:
-        raise ValueError(f"Payabl: need 'Custom 3'+'Amount'. Columns: {list(psp.columns)}")
-    # CONFIRMED: BP merchantOrderId = Payabl Custom 3 (from conversation)
-    moi_col = find_col(bp_df, ["merchantOrderId","merchant_order_id","MerchantOrderID"])
+        raise ValueError(f"Payabl: need 'Transaction ID'+'Amount'. Columns: {list(psp.columns)}")
+    moi_col = find_col(bp_df, ["transactionId","transaction_id","TransactionId"])
     a_col   = find_col(bp_df, ["amount","Amount"])
     if not moi_col or not a_col: return pd.DataFrame()
     return _match(psp, pid, amt, bp_df, moi_col, a_col, "Payabl", tol)
@@ -258,26 +314,19 @@ def recon_payabl(bp_df, files, tol=TOL):
 def recon_paysafe_bp(bp_df, files, tol=TOL):
     """
     Paysafe under Bridgerpay
-    VERIFIED against actual files:
-      - Base: BP rows with pspName=Paysafe → 23,386 rows
-      - Filter: PS Transaction Type = Settlement (one row per txn, final settled amount)
-      - Match: BP transactionId = PS Transaction ID
-      - Amount: BP amount vs PS Amount
-      - Result: 23,311 / 23,386 = 99.7%  (75 BP rows not yet in PS = pending settlement)
+    Match: BP transactionId = PS Transaction ID
+    Amount: BP amount vs PS Amount
+    Base: BP rows with pspName=Paysafe (no PSP-side filter)
     """
     psp = _load_psp(files)
     if psp.empty: return pd.DataFrame()
 
     tid = find_col(psp, ["Transaction ID","TransactionID","transaction_id"])
     amt = find_col(psp, ["Amount","amount","Settlement Amount"])
-    txtype = find_col(psp, ["Transaction Type","TransactionType","transaction_type"])
     if not tid or not amt:
         raise ValueError(f"Paysafe(BP): need 'Transaction ID'+'Amount'. Columns: {list(psp.columns)}")
 
     psp[amt] = to_numeric_col(psp[amt])
-    # Filter to Settlement rows only — each transaction has 3 rows (Payment Handle, authorization, Settlement)
-    if txtype:
-        psp = psp[psp[txtype].astype(str).str.lower() == "settlement"].copy()
     psp_d = psp.drop_duplicates(subset=tid, keep="first")
 
     # Base: BP rows with pspName=Paysafe — correct denominator
@@ -351,27 +400,19 @@ def recon_skrill(pp_df, files, tol=TOL):
 def recon_paysafe_pp(pp_df, files, tol=TOL):
     """
     Paysafe under Payprocc
-    VERIFIED against actual files:
-      - Filter: PS Transaction Type = Settlement
-      - Scope: PS rows whose Merchant Transaction ID appears in PP Payment Public IDs
-               (PP transactions are UUID — many other Paysafe rows belong to other merchants)
-      - Match: PS Merchant Transaction ID = PP Payment Public ID
-      - Amount: PP Amount (LOCAL currency) vs PS Amount — NOT _usd
-      - Result: 4,803 / 4,803 = 100%
+    Match: PS Merchant Transaction ID = PP Payment Public ID
+    Amount: PP Amount (LOCAL currency) vs PS Amount
+    No filter
     """
     psp = _load_psp(files)
     if psp.empty: return pd.DataFrame()
 
     mid    = find_col(psp, ["Merchant Transaction ID","MerchantTransactionID","merchant_transaction_id"])
     amt    = find_col(psp, ["Amount","amount","Settlement Amount"])
-    txtype = find_col(psp, ["Transaction Type","TransactionType","transaction_type"])
     if not mid or not amt:
         raise ValueError(f"Paysafe(PP): need 'Merchant Transaction ID'+'Amount'. Columns: {list(psp.columns)}")
 
     psp[amt] = to_numeric_col(psp[amt])
-    # Filter to Settlement rows only
-    if txtype:
-        psp = psp[psp[txtype].astype(str).str.lower() == "settlement"].copy()
 
     pub   = find_col(pp_df, ["Payment Public ID","PaymentPublicID","payment_public_id"])
     a_col = find_col(pp_df, ["Amount","amount"])  # LOCAL currency — NOT _usd
@@ -383,9 +424,23 @@ def recon_paysafe_pp(pp_df, files, tol=TOL):
 
     if psp_scoped.empty: return pd.DataFrame()
 
-    m = psp_scoped[[mid, amt]].merge(
-        pp_df[[pub, a_col]].rename(columns={pub:"_k", a_col:"Orch_Amount_raw"}),
-        left_on=mid, right_on="_k", how="left")
+    # Also pull PP Merchant Order ID so _collect_psp_rows can map to API TID
+    pp_moi = find_col(pp_df, ["Merchant Order ID","MerchantOrderID","merchant_order_id"])
+    pp_cols = [pub, a_col]
+    if pp_moi and pp_moi != pub:
+        pp_cols.append(pp_moi)
+
+    pp_sub = pp_df[pp_cols].rename(columns={
+        pub: "_k",
+        a_col: "Orch_Amount_raw",
+        **(  {pp_moi: "_api_tid"} if pp_moi and pp_moi != pub else {} )
+    })
+
+    m = psp_scoped[[mid, amt]].merge(pp_sub, left_on=mid, right_on="_k", how="left")
+
+    if "_api_tid" not in m.columns:
+        m["_api_tid"] = m["_k"]  # fallback: PP Payment Public ID
+
     m["PSP_Amount"]  = to_numeric_col(m[amt].astype(str))
     m["Orch_Amount"] = to_numeric_col(m["Orch_Amount_raw"].astype(str))
     m["Verdict"]     = _verdict_psp_base(m, "PSP_Amount", "Orch_Amount", tol)
@@ -413,6 +468,7 @@ def reconcile_phase2(phase1_results, psp_map, tol_usd=TOL):
         ("trustpay",    recon_trustpayment),
         ("payabl",      recon_payabl),
         ("paysafe_bp",  recon_paysafe_bp),
+        ("zen_bp",      recon_zen_bp),
     ]
     runners_pp = [
         ("dlocal",      recon_dlocal),

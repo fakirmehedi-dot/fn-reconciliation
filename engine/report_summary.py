@@ -40,15 +40,28 @@ def compute_summary_stats(api_df, results):
     api_df["_gt"] = pd.to_numeric(api_df.get(gt_col, 0), errors="coerce").fillna(0)
     tids = set(api_df[tid_col].dropna())
 
+    # Also collect Tracking IDs for Coinsbuy/Confirmo matching
+    trk_col = None
+    for c in api_df.columns:
+        if "tracking id" in c.lower():
+            trk_col = c; break
+    trk_ids = set(api_df[trk_col].dropna()) if trk_col else set()
+
     api_orders   = len(api_df)
-    orch_tids    = tids & orch_ids
-    psp_tids     = tids & psp_ids
-    orch_orders  = len(orch_tids)
-    psp_orders   = len(psp_tids)
+    # An order is matched if EITHER its Transaction ID or Tracking ID is in the set
+    orch_mask = api_df[tid_col].isin(orch_ids)
+    if trk_col:
+        orch_mask = orch_mask | api_df[trk_col].isin(orch_ids)
+    psp_mask = api_df[tid_col].isin(psp_ids)
+    if trk_col:
+        psp_mask = psp_mask | api_df[trk_col].isin(psp_ids)
+
+    orch_orders  = int(orch_mask.sum())
+    psp_orders   = int(psp_mask.sum())
 
     api_rev  = api_df["_gt"].sum()
-    orch_rev = api_df[api_df[tid_col].isin(orch_ids)]["_gt"].sum()
-    psp_rev  = api_df[api_df[tid_col].isin(psp_ids)]["_gt"].sum()
+    orch_rev = api_df[orch_mask]["_gt"].sum()
+    psp_rev  = api_df[psp_mask]["_gt"].sum()
 
     return dict(
         api_orders=api_orders, orch_orders=orch_orders,
@@ -149,6 +162,7 @@ def write_full_summary(api_df, results, start_date, end_date):
         ws.write(3, ci, v, fmt)
 
     # Also show per-bank Phase 1 breakdown below
+    ri = 5
     if "combined" in results:
         ws.write(5, 0, "Phase 1 — Bank Breakdown", f["hdr1"])
         for ci, h in enumerate(["Bank", "API Rows", "Reconciled", "Mismatch", "Not In Bank", "Match %"]):
@@ -190,6 +204,82 @@ def write_full_summary(api_df, results, start_date, end_date):
             ws.write(ri, 4, int(nio),   f["diff"])
             ws.write(ri, 5, f"{pct:.1f}%", f["name"])
             ri += 1
+
+    # ── Add Order Wise + Amount Wise sheets ──────────────────────────────────
+    try:
+        data = build_order_wise(api_df, results, results.get("phase2", {}))
+        if data:
+            rows_ow  = data["rows"]
+            p1_label = data["p1_label"]
+            p2_label = data["p2_label"]
+
+            for sheet_name, use_rev in [("Order Wise", False), ("Amount Wise", True)]:
+                ws2 = wb.add_worksheet(sheet_name)
+                ws2.freeze_panes(4, 2)
+                ws2.set_column("A:A", 26)
+                ws2.set_column("B:B", 10)
+                for ci in range(2, 12):
+                    ws2.set_column(ci, ci, 16)
+
+                sfx   = "rev" if use_rev else "n"
+                d_sfx = "_rev" if use_rev else ""
+                lbl   = "Revenue (USD)" if use_rev else "Orders"
+                vfmt  = f["val2"] if use_rev else f["val"]
+                dfmt  = f["diff2"] if use_rev else f["diff"]
+
+                ws2.merge_range(0, 0, 0, 11,
+                    f"Revenue Reconciliation — {lbl}  |  {p1_label} vs {p2_label}", f["title"])
+                ws2.merge_range(1, 0, 1, 1, "Package / Plan", f["hdr1"])
+                ws2.merge_range(1, 2, 1, 6, p1_label, f["hdr1"])
+                ws2.merge_range(1, 7, 1, 11, p2_label, f["hdr1"])
+                for ci, lh in enumerate(["", "", "API", "Orchestrator", "Diff (API-Orch)",
+                                          "PSP Reconciled", "Diff (API-PSP)"] +
+                                         ["API", "Orchestrator", "Diff (API-Orch)",
+                                          "PSP Reconciled", "Diff (API-PSP)"]):
+                    ws2.write(2, ci, lh if ci > 1 else ("Package" if ci==0 else "Plan"), f["hdr2"])
+                for ci in range(12):
+                    ws2.write(3, ci, lbl if ci >= 2 else ("Package" if ci==0 else "Plan"), f["hdr2"])
+
+                ri2 = 4
+                prev_pkg2 = None
+                for r in rows_ow:
+                    pkg = r["Package"]; plan = r["Plan"]
+                    is_tot = r["_is_total"]; is_grand = pkg == "GRAND TOTAL"
+
+                    if not is_tot and not is_grand and pkg != prev_pkg2:
+                        if pkg in FUTURES_PACKAGES and prev_pkg2 is None:
+                            ws2.merge_range(ri2, 0, ri2, 11, "── FUTURES ──", f["pkg"])
+                            ri2 += 1
+                        elif pkg in CFD_PACKAGES and (prev_pkg2 is None or prev_pkg2 not in CFD_PACKAGES):
+                            ws2.merge_range(ri2, 0, ri2, 11, "── CFD ──", f["pkg"])
+                            ri2 += 1
+                        prev_pkg2 = pkg
+
+                    nf2 = f["grand"] if is_grand else (f["tot"] if is_tot else f["name"])
+                    vf2 = f["grand"] if is_grand else (f["tot"] if is_tot else vfmt)
+                    df2 = f["grand"] if is_grand else (f["tot"] if is_tot else dfmt)
+
+                    vals = [
+                        pkg, plan,
+                        r.get(f"P1_api_{sfx}", 0),
+                        r.get(f"P1_orch_{sfx}", 0),
+                        r.get(f"P1_diff_orch{d_sfx}", 0),
+                        r.get(f"P1_psp_{sfx}", 0),
+                        r.get(f"P1_diff_psp{d_sfx}", 0),
+                        r.get(f"P2_api_{sfx}", 0),
+                        r.get(f"P2_orch_{sfx}", 0),
+                        r.get(f"P2_diff_orch{d_sfx}", 0),
+                        r.get(f"P2_psp_{sfx}", 0),
+                        r.get(f"P2_diff_psp{d_sfx}", 0),
+                    ]
+                    ws2.write(ri2, 0, vals[0], nf2)
+                    ws2.write(ri2, 1, vals[1], nf2)
+                    for ci in range(2, 12):
+                        is_diff = ci in (4, 6, 9, 11)
+                        ws2.write(ri2, ci, vals[ci], df2 if is_diff else vf2)
+                    ri2 += 1
+    except Exception as _e:
+        pass  # Order/Amount wise sheets are optional
 
     wb.close()
     buf.seek(0)
@@ -301,6 +391,87 @@ def write_comparison_summary(api_df, results):
                 ws.write(ri, ci + 2, v, fmt)
             ri += 1
 
+    # ── Add Order Wise + Amount Wise sheets ──────────────────────────────────
+    try:
+        data = build_order_wise(api_df, results, results.get("phase2", {}))
+        if data:
+            rows_ow  = data["rows"]
+            p1_label = data["p1_label"]
+            p2_label = data["p2_label"]
+
+            for sheet_name, use_rev in [("Order Wise", False), ("Amount Wise", True)]:
+                ws2 = wb.add_worksheet(sheet_name)
+                ws2.freeze_panes(4, 2)
+                ws2.set_column("A:A", 26)
+                ws2.set_column("B:B", 10)
+                for ci in range(2, 12):
+                    ws2.set_column(ci, ci, 16)
+
+                sfx   = "rev" if use_rev else "n"
+                d_sfx = "_rev" if use_rev else ""
+                lbl   = "Revenue (USD)" if use_rev else "Orders"
+                vfmt  = f["val2"] if use_rev else f["val"]
+                dfmt  = f["diff2"] if use_rev else f["diff"]
+
+                ws2.merge_range(0, 0, 0, 11,
+                    f"Revenue Reconciliation — {lbl}  |  {p1_label} vs {p2_label}", f["title"])
+                ws2.merge_range(1, 0, 1, 1, "Package / Plan", f["hdr1"])
+                ws2.merge_range(1, 2, 1, 6, p1_label, f["hdr1"])
+                ws2.merge_range(1, 7, 1, 11, p2_label, f["hdr1"])
+                for ci, lh in enumerate(["", "", "API", "Orchestrator", "Diff (API-Orch)",
+                                          "PSP Reconciled", "Diff (API-PSP)"] +
+                                         ["API", "Orchestrator", "Diff (API-Orch)",
+                                          "PSP Reconciled", "Diff (API-PSP)"]):
+                    ws2.write(2, ci, lh if ci > 1 else ("Package" if ci==0 else "Plan"), f["hdr2"])
+                for ci in range(12):
+                    ws2.write(3, ci, lbl if ci >= 2 else ("Package" if ci==0 else "Plan"), f["hdr2"])
+
+                ri2 = 4
+                prev_pkg2 = None
+                for r in rows_ow:
+                    pkg = r["Package"]; plan = r["Plan"]
+                    is_tot = r["_is_total"]; is_grand = pkg == "GRAND TOTAL"
+
+                    if not is_tot and not is_grand and pkg != prev_pkg2:
+                        if pkg in FUTURES_PACKAGES and prev_pkg2 is None:
+                            ws2.merge_range(ri2, 0, ri2, 11, "── FUTURES ──", f["pkg"])
+                            ri2 += 1
+                        elif pkg in CFD_PACKAGES and (prev_pkg2 is None or prev_pkg2 not in CFD_PACKAGES):
+                            ws2.merge_range(ri2, 0, ri2, 11, "── CFD ──", f["pkg"])
+                            ri2 += 1
+                        prev_pkg2 = pkg
+
+                    nf2 = f["grand"] if is_grand else (f["tot"] if is_tot else f["name"])
+                    vf2 = f["grand"] if is_grand else (f["tot"] if is_tot else vfmt)
+                    df2 = f["grand"] if is_grand else (f["tot"] if is_tot else dfmt)
+
+                    vals = [
+                        pkg, plan,
+                        r.get(f"P1_api_{sfx}", 0),
+                        r.get(f"P1_orch_{sfx}", 0),
+                        r.get(f"P1_diff_orch{d_sfx}", 0),
+                        r.get(f"P1_psp_{sfx}", 0),
+                        r.get(f"P1_diff_psp{d_sfx}", 0),
+                        r.get(f"P2_api_{sfx}", 0),
+                        r.get(f"P2_orch_{sfx}", 0),
+                        r.get(f"P2_diff_orch{d_sfx}", 0),
+                        r.get(f"P2_psp_{sfx}", 0),
+                        r.get(f"P2_diff_psp{d_sfx}", 0),
+                    ]
+                    ws2.write(ri2, 0, vals[0], nf2)
+                    ws2.write(ri2, 1, vals[1], nf2)
+                    for ci in range(2, 12):
+                        is_diff = ci in (4, 6, 9, 11)
+                        ws2.write(ri2, ci, vals[ci], df2 if is_diff else vf2)
+                    ri2 += 1
+    except Exception as _e:
+        pass  # Order/Amount wise sheets are optional
+
     wb.close()
     buf.seek(0)
     return buf
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Report 2 — Comparison Summary (Package/Plan × Period)
+# ─────────────────────────────────────────────────────────────────────────────

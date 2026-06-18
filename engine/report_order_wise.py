@@ -110,23 +110,15 @@ def _build_orch_set(phase1_results):
     for key in ["bridgerpay", "payprocc", "coinsbuy", "zen", "confirmo", "tcpay"]:
         df = phase1_results.get(key, pd.DataFrame())
         if df.empty: continue
-        # All reconciled + mismatch rows = found in orchestrator
         matched = df[df.get("Verdict", df.get("verdict", pd.Series())).isin(
             ["RECONCILED", "AMOUNT MISMATCH", "MATCHED (FEE DEDUCTED)"])]
-        # Transaction ID is the API key column
-        tid_col = None
+        if matched.empty: continue
+        # Add BOTH Transaction ID and Tracking ID
+        # (Coinsbuy/Confirmo have non-prefixed Transaction IDs like inv... or numeric)
         for c in matched.columns:
-            if "transaction id" in c.lower() or c == "Transaction ID":
-                tid_col = c
-                break
-        if not tid_col:
-            # Try to get from index or first column that looks like a TID
-            for c in matched.columns:
-                if matched[c].astype(str).str.startswith(("BP_","PP_","ZP_","B2B_","CFM_","OP-"), na=False).any():
-                    tid_col = c
-                    break
-        if tid_col:
-            orch_ids.update(matched[tid_col].dropna().tolist())
+            cl = c.lower().replace(" ", "")
+            if cl in ("transactionid", "trackingid"):
+                orch_ids.update(matched[c].dropna().astype(str).tolist())
     return orch_ids
 
 
@@ -146,11 +138,15 @@ def _build_psp_set(phase1_results, phase2_results):
         if df.empty: continue
         matched = df[df.get("Verdict", pd.Series()).isin(
             ["RECONCILED", "AMOUNT MISMATCH", "MATCHED (FEE DEDUCTED)"])]
+        if matched.empty: continue
+
+        # Add BOTH Transaction ID and Tracking ID to psp_ids
+        # (Coinsbuy/Confirmo match on Tracking ID but dashboard checks Transaction ID)
         for c in matched.columns:
-            if matched[c].astype(str).str.startswith(
-                    ("ZP_","B2B_","CFM_","OP-"), na=False).any():
-                psp_ids.update(matched[c].dropna().tolist())
-                break
+            cl = c.lower().replace(" ", "")
+            if cl in ("transactionid",) or cl in ("trackingid",):
+                vals = matched[c].dropna().astype(str)
+                psp_ids.update(vals.tolist())
 
     # ── Build lookup maps from raw orchestrator frames ────────────────────────
     bp_raw = phase1_results.get("bp_raw", pd.DataFrame())
@@ -180,7 +176,7 @@ def _build_psp_set(phase1_results, phase2_results):
     # ── Phase 2 PSP results ───────────────────────────────────────────────────
     for psp_key, df2 in phase2_results.items():
         if df2 is None or df2.empty: continue
-        rec = df2[df2.get("Verdict", pd.Series()) == "RECONCILED"]
+        rec = df2[df2.get("Verdict", pd.Series()).isin(["RECONCILED", "AMOUNT MISMATCH"])]
         if rec.empty: continue
 
         # Priority 1: _api_tid column (added by recon_trustpayment, recon_paysafe_bp)

@@ -202,12 +202,16 @@ def build_phase2_summary(results):
         orch_qty = len(df)
         orch_amt = float(to_numeric_col(df.get("Orch_Amount", pd.Series()).astype(str)).sum())
         psp_qty  = len(recon) + len(mismatch)
-        psp_amt  = float(to_numeric_col(df.get("PSP_Amount", pd.Series()).astype(str)).sum())
+        # PSP Amt = only matched rows (not NaN from unmatched)
+        matched_df = df[df["Verdict"].isin(["RECONCILED","AMOUNT MISMATCH"])]
+        psp_amt  = float(to_numeric_col(matched_df.get("PSP_Amount", pd.Series()).astype(str)).sum())
+        # Mismatch = key matched but amount differs
         mm_qty   = len(mismatch)
-        mm_amt   = float((df.get("PSP_Amount", pd.Series()) - df.get("Orch_Amount", pd.Series())).fillna(0).sum())
+        mm_amt   = float(mismatch.get("Diff (USD)", pd.Series()).fillna(0).abs().sum()) if not mismatch.empty else 0
+        # Not in PSP = key not found
         nip_qty  = len(not_in)
-        nip_amt  = float(to_numeric_col(not_in.get("PSP_Amount", pd.Series()).astype(str)).sum())
-        extra_qty= 0   # Not directly available in current structure
+        nip_amt  = float(to_numeric_col(not_in.get("Orch_Amount", pd.Series()).astype(str)).sum())
+        extra_qty= 0
         extra_amt= 0.0
         match_pct= len(recon) / orch_qty * 100 if orch_qty else 0.0
 
@@ -217,8 +221,8 @@ def build_phase2_summary(results):
             "Orchestrator Amt":  round(orch_amt, 2),
             "PSP Qty":           psp_qty,
             "PSP Amt":           round(psp_amt, 2),
-            "Mismatch Qty":      orch_qty - psp_qty,
-            "Mismatch Amt":      round(orch_amt - psp_amt, 2),
+            "Mismatch Qty":      mm_qty,
+            "Mismatch Amt":      round(mm_amt, 2),
             "Not in PSP Qty":    nip_qty,
             "Not in PSP Amt":    round(nip_amt, 2),
             "Extra in PSP Qty":  extra_qty,
